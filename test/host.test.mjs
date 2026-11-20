@@ -57,13 +57,22 @@ function makeAgent(sessionId = 'session-1') {
 
 let agentState;
 
+const DEFAULT_HEADERS = {
+  'session-1': { isSeeded: false },
+  'child-1': { isSeeded: true },
+};
+
 function makeCtx(options = {}) {
   agentState = { sections: [], disposed: 0 };
   const registered = { commands: [], tools: [], events: [], effects: [] };
   const agent = makeAgent(options.sessionId ?? 'session-1');
+  const headers = options.headers ?? DEFAULT_HEADERS;
   const ctx = {
     sessionController: {
       fork: options.fork ?? (async () => ({ sessionId: 'child-1' })),
+    },
+    sessions: {
+      get: id => (headers[id] === undefined ? undefined : { header: headers[id] }),
     },
     commands: { register: definition => { registered.commands.push(definition); return disposer; } },
     tools: { register: definition => { registered.tools.push(definition); return disposer; } },
@@ -92,6 +101,7 @@ test('Host exports a callable Config with the documented defaults', () => {
   assert.ok(host.inject.includes('tools'));
   assert.ok(host.inject.includes('systemPrompt'));
   assert.ok(host.inject.includes('agents'));
+  assert.ok(host.inject.includes('sessions'));
 });
 
 test('apply registers one command, one tool, one scoped section and both agent events', () => {
@@ -108,7 +118,7 @@ test('apply registers one command, one tool, one scoped section and both agent e
   assert.ok(registered.events.includes('agent/disposed'));
 });
 
-test('createSideChat forks once, hides the boundary and registers it for the child', async () => {
+test('createSideChat forks once and keeps the boundary out of the draft', async () => {
   let forks = 0;
   const { ctx } = makeCtx({ fork: async () => { forks += 1; return { sessionId: 'child-1' }; } });
   const service = host.apply(ctx, host.Config({}));
@@ -120,16 +130,32 @@ test('createSideChat forks once, hides the boundary and registers it for the chi
   assert.equal(result.depth, 1);
   assert.equal(result.draftText, '> alpha\n> beta', 'hidden boundary is not written into the draft');
   assert.ok(service.boundaryFor('child-1').includes('Inherited history'));
-  assert.equal(service.boundaryFor('session-1'), undefined);
+  assert.equal(service.boundaryFor('session-1'), undefined, 'the parent is not a fork');
 });
 
-test('hiddenBoundary=false restores the visible boundary note in the draft', async () => {
-  const { ctx } = makeCtx();
-  const service = host.apply(ctx, host.Config({ hiddenBoundary: false }));
-  const result = await service.createSideChat({ sessionId: 'session-1', text: 'alpha', depth: 0 });
-  assert.ok(result.draftText.startsWith('> alpha'));
-  assert.ok(result.draftText.includes('Inherited history'));
-  assert.equal(service.boundaryFor('child-1'), undefined);
+test('the hidden section is installed only for forked, non-subagent Sessions', () => {
+  const { ctx } = makeCtx({ headers: { 's-fork': { isSeeded: true }, 's-main': { isSeeded: false }, 's-sub': { isSeeded: true, origin: 'subagent' } } });
+  host.apply(ctx, host.Config({}));
+  const text = agentState.sections[0].text;
+  assert.ok(typeof text === 'function');
+  // Rebind the agent's sessionId through the closure is not possible; instead
+  // verify the pure predicate directly.
+  assert.equal(host.helpers.isSideChatSession(ctx, 's-fork'), true);
+  assert.equal(host.helpers.isSideChatSession(ctx, 's-main'), false);
+  assert.equal(host.helpers.isSideChatSession(ctx, 's-sub'), false);
+  assert.equal(host.helpers.isSideChatSession(ctx, 'missing'), false);
+});
+
+test('hiddenBoundary=false yields an empty section even for a fork', () => {
+  const { ctx } = makeCtx({ sessionId: 'child-1' });
+  host.apply(ctx, host.Config({ hiddenBoundary: false }));
+  assert.equal(agentState.sections[0].text(), '');
+});
+
+test('the hidden section text is the boundary for a fork, and empty otherwise', () => {
+  const { ctx } = makeCtx({ sessionId: 'child-1' });
+  host.apply(ctx, host.Config({}));
+  assert.ok(agentState.sections[0].text().includes('Inherited history'));
 });
 
 test('a blank side chat gets a no-selection line, and long text a truncation note', async () => {
@@ -155,7 +181,7 @@ test('fork failures carry a stable code for the Client to localize', async () =>
   const result = await service.createSideChat({ sessionId: 'session-1', text: 'x', depth: 0 });
   assert.equal(result.ok, false);
   assert.equal(result.code, 'session/migration-required');
-  assert.equal(service.boundaryFor('child-1'), undefined);
+  assert.equal(service.boundaryFor('missing-child'), undefined);
 });
 
 test('one operation, two callers: UI command and agent tool produce the same result', async () => {

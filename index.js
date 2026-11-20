@@ -24,13 +24,17 @@ const requireFromDsh = createRequire(`${dshRoot}/package.json`)
 const z = requireFromDsh('@deepseek-ai/schemastery')
 const { defineTool } = requireFromDsh('@deepseek-ai/dsh-tools')
 
-const DEFAULT_BOUNDARY = 'You are in a side chat forked from a parent conversation. '
-  + 'Inherited history is for reference only. Answer here; do not continue the parent task, '
-  + 'do not change files, and do not run tools unless explicitly asked.'
+// Applies to forked Sessions (the durable `header.isSeeded` marker), which is
+// how the Host recognises a side chat without any Client->Host RPC. Wording is
+// deliberately neutral so an ordinary user fork is not disrupted either.
+const DEFAULT_BOUNDARY = 'This Session was forked from a parent conversation. '
+  + 'Inherited history is reference context only. Answer the user\'s current request here; '
+  + 'do not assume the parent task continues, do not change files, '
+  + 'and do not run tools unless explicitly asked.'
 
 /** Tunable values live in cordis.patch.yml under this row's `config`. */
 export const Config = z.object({
-  /** Deliver the boundary as a hidden prompt section instead of visible draft text. */
+  /** Install the hidden developer boundary for forked (side-chat) Sessions. */
   hiddenBoundary: z.boolean().default(true),
   /** Show an informational composer notice after a successful create. */
   successNotice: z.boolean().default(false),
@@ -38,7 +42,7 @@ export const Config = z.object({
   boundaryText: z.string().default(DEFAULT_BOUNDARY),
 })
 
-export const inject = ['sessionController', 'commands', 'tools', 'systemPrompt', 'agents']
+export const inject = ['sessionController', 'commands', 'tools', 'systemPrompt', 'agents', 'sessions']
 
 export const name = 'side-chat'
 
@@ -73,20 +77,28 @@ export const helpers = {
     const limit = Number.isFinite(max) && max > 0 ? Math.floor(max) : 28
     return trimmed.length <= limit ? trimmed : `${trimmed.slice(0, limit)}…`
   },
-  /** Compose the draft for one side chat; `boundary` is omitted when hidden. */
-  draftText(text, boundary, includeBoundary) {
+  /** Compose a clean draft: quote + optional notes, never the boundary text. */
+  draftText(text) {
     const hasQuote = String(text ?? '').trim() !== ''
-    const quote = hasQuote ? `${helpers.quoteBlock(helpers.capText(text))}\n\n` : `${NO_SELECTION}\n\n`
+    const quote = hasQuote ? helpers.quoteBlock(helpers.capText(text)) : NO_SELECTION
     const truncation = String(text ?? '').length > MAX_TEXT ? `\n\n${TRUNCATED}` : ''
-    return `${quote}${includeBoundary ? '' : `${boundary}\n\n`}${truncation}`.trimEnd()
+    return `${quote}${truncation}`
+  },
+  /** True for a forked (side-chat) Session, excluding subagent children. */
+  isSideChatSession(ctx, sessionId) {
+    if (!sessionId) return false
+    const session = ctx.sessions.get(sessionId)
+    if (session === undefined) return false
+    return session.header.isSeeded === true && session.header.origin !== 'subagent'
   },
 }
 
 /**
- * Create one side chat. Returns an explicit result; failures carry a stable
- * `code` so the Client can map them to localized notices.
+ * Create one side chat (agent-tool caller). The UI uses `ctx.sessions.fork()`
+ * directly; both paths produce the same kind of forked Session, which the Host
+ * recognises through the durable `header.isSeeded` marker.
  */
-async function createSideChat(ctx, config, boundaries, { sessionId, text, depth = 0 }) {
+async function createSideChat(ctx, config, { sessionId, text, depth = 0 }) {
   if (!Number.isFinite(depth) || depth < 0) {
     return { ok: false, code: 'bad-request', reason: 'invalid depth' }
   }
@@ -99,16 +111,11 @@ async function createSideChat(ctx, config, boundaries, { sessionId, text, depth 
       : 'session/fork-unavailable'
     return { ok: false, code, reason: error instanceof Error ? error.message : String(error) }
   }
-  const childSessionId = forkValue.sessionId
-  const boundary = config.boundaryText
-  const draftText = helpers.draftText(text, boundary, config.hiddenBoundary)
-  if (config.hiddenBoundary) boundaries.set(childSessionId, boundary)
-  const label = helpers.firstLine(text) || UNTITLED
   return {
     ok: true,
-    childSessionId,
-    draftText,
-    label,
+    childSessionId: forkValue.sessionId,
+    draftText: helpers.draftText(text),
+    label: helpers.firstLine(text) || UNTITLED,
     depth: depth + 1,
     successNotice: config.successNotice,
   }
@@ -122,16 +129,13 @@ export function apply(ctx, config = {}) {
     successNotice: config.successNotice ?? false,
     boundaryText: config.boundaryText ?? DEFAULT_BOUNDARY,
   }
-  /** Derived cache: child Session id -> hidden boundary text. Not persisted. */
-  const boundaries = new Map()
   /** agent -> scoped fiber owning its prompt section (double ownership). */
   const fibers = new Map()
 
-  // One operation, two callers. Both the command handler and the tool below
-  // call this exact object; no second implementation exists in the Client.
   const service = {
-    createSideChat: request => createSideChat(ctx, resolved, boundaries, request),
-    boundaryFor: sessionId => boundaries.get(sessionId),
+    createSideChat: request => createSideChat(ctx, resolved, request),
+    boundaryFor: sessionId => (helpers.isSideChatSession(ctx, sessionId)
+      && resolved.hiddenBoundary ? resolved.boundaryText : undefined),
   }
 
   const installPrompt = (agent) => {
@@ -140,7 +144,10 @@ export function apply(ctx, config = {}) {
       scope.systemPrompt.section({
         name: SECTION_NAME,
         order: scope.systemPrompt.getSectionOrder('WEB_SURFACE') + 1,
-        text: () => (resolved.hiddenBoundary ? boundaries.get(agent.sessionId) ?? '' : ''),
+        // Evaluated at prompt assembly, after the fork header is available —
+        // and still correct after a restart, because `isSeeded` is durable.
+        text: () => (resolved.hiddenBoundary && helpers.isSideChatSession(ctx, agent.sessionId)
+          ? resolved.boundaryText : ''),
       })
     })
     fibers.set(agent, fiber)
@@ -154,7 +161,6 @@ export function apply(ctx, config = {}) {
     if (fiber === undefined) return
     fibers.delete(agent)
     void fiber.dispose()
-    boundaries.delete(agent.sessionId)
   })
 
   // The plugin's own effect must also own every agent-scoped registration:
@@ -162,7 +168,6 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => () => {
     for (const fiber of fibers.values()) void fiber.dispose()
     fibers.clear()
-    boundaries.clear()
   }, 'side-chat: per-agent prompt sections')
 
   // Client-callable entry point. `recordInput: false` keeps the selection out

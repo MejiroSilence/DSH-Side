@@ -47,7 +47,7 @@ Rollback: `plugin_manager action=remove_bundle target=@local/dsh-side-chat`, the
 | **Home page** | Explains the flows, starts a blank side chat, lists **Recent side chats** |
 
 - **Recent side chats** live in browser `localStorage` (`dsh.sidechat.recent`, 20 entries max). Closing a tab does not delete the child; clicking an entry calls `openResource` on the **same address**, so the existing tab is revealed — no new fork, no duplicate draft. An entry whose child is no longer in the session list is removed with a localized notice.
-- `/side` and the home page create a blank side chat: the draft has a localized "no selection" line plus the boundary note, no empty blockquote.
+- `/side` and the home page create a blank side chat: the draft has a localized "no selection" line and no empty blockquote. After batch B it carries no boundary note either.
 - **Recursion is capped at 3 levels** (`depth` in the address; v1 addresses parse as depth 0, so old tabs still work). Forking from a too-deep side chat shows a localized error instead of creating a grandchild.
 - **Truncated selections get a visible note** after the boundary, never inside the quoted text.
 - A failed tab open still records the child **together with its staged prompt**, so retrying from the home page restores the original quoted selection instead of opening an empty draft. The prompt is cleared once the retry succeeds.
@@ -55,52 +55,52 @@ Rollback: `plugin_manager action=remove_bundle target=@local/dsh-side-chat`, the
 
 ## v2 batch B (current)
 
-The Host half is now real. One operation, two callers:
+The Host half now delivers the developer boundary as a **hidden** system-prompt
+section, so the side-chat draft contains only the selected quote — no visible
+note. Creating a side chat involves **no Client→Host RPC**.
 
-| Caller | Path |
+| Piece | What it does |
 | --- | --- |
-| Web UI | `ctx.remote.commands.execute(parent, '/side-chat-fork …')` → `side-chat-fork` session command → `createSideChat()` |
-| Agent | `side_chat_create` tool → the **same** `createSideChat()` |
+| Client (`client.js`) | Creates the child with the proven `ctx.sessions.fork()` path, stages a clean draft (quote + optional no-selection / truncation notes), opens the tab |
+| Host (`index.js`) | On `agent/created`, installs a `ctx.systemPrompt.section()` whose `text()` returns the boundary only for forked Sessions |
+| Agent tool | `side_chat_create` still calls the Host `createSideChat()` operation |
 
-`createSideChat()` (in `index.js`) is the only place that forks a Session
-(`ctx.sessionController.fork`), composes the draft text and registers the hidden
-boundary. The Client half only refreshes the session catalog, stages the returned
-draft and opens the tab — no second fork implementation.
+- **How the Host recognises a side chat**: a fork sets a durable
+  `header.isSeeded` marker on the Session. The section's `text()` reads
+  `ctx.sessions.get(id).header` at prompt-assembly time and skips subagent
+  children (`origin === 'subagent'`). Because the marker is persisted, the
+  boundary **survives a DSH restart** — there is no in-process cache and no new
+  Session event type.
+- Registrations are double-owned (`agent.ctx` fiber + the plugin's own effect),
+  with `agent/disposed` cleanup.
+- **Config** (`cordis.patch.yml` row `config`): `hiddenBoundary` (default `true`),
+  `successNotice` (default `false`), `boundaryText` (override the developer text).
+  Turning `hiddenBoundary` off removes the hidden section entirely; the draft has
+  no boundary note either.
+- **Row renamed** to `side-chat-v2` so the Host module loads fresh (Host modules
+  are cached by row specifier). `list_plugins` shows `include:side-chat-v2`;
+  Client module id, resource protocol, tab kinds, interaction id and address
+  format are unchanged.
+- **Changing Host code** needs `remove_bundle @local/dsh-side-chat` →
+  `install_bundle <path-to-checkout>`, or a DSH restart. Client-only
+  edits need the DSH window reloaded — a full `Cmd+Q` quit and reopen is the
+  reliable way (HMR only re-pulls the module script, it does not re-run `apply`).
 
-- **Hidden developer boundary**: `agent/created` installs a `ctx.systemPrompt.section()`
-  on each agent's scoped context. Its `text()` reads the boundary registered for
-  that side-chat child, so the draft no longer carries the visible boundary note
-  when `hiddenBoundary` is on. Registrations are double-owned (`agent.ctx` fiber
-  plus the plugin's own effect). No new Session event types are written.
-- **Config** (in `cordis.patch.yml` under the row's `config`): `hiddenBoundary`
-  (default `true`), `successNotice` (default `false`), `boundaryText` (override
-  the developer text). Turning `hiddenBoundary` off restores the v1 visible note.
-- **Row renamed** to `side-chat-v2` so the Host module is loaded fresh (Host
-  modules are cached by row specifier). `list_plugins` now shows
-  `include:side-chat-v2`; the Client module id, resource protocol, tab kinds,
-  interaction id and address format are unchanged.
-- **Changing Host code** now needs `remove_bundle @local/dsh-side-chat` →
-  `install_bundle <path-to-checkout>` with a **new row name**, or a DSH
-  restart. Client-only edits still need just a page refresh.
+**Scope note**: the boundary is applied to every forked Session that is not a
+subagent, including an ordinary user-initiated fork. The wording is neutral
+("inherited history is reference context; answer the current request here"), so
+it does not disrupt a normal fork.
 
-**Fallback**: a session command writes `command/run` / `command/done` into the
-source Session log and can fail for reasons unrelated to the fork. If the Host
-entry point is missing or fails (except `session/migration-required`), the Client
-falls back to the proven `ctx.sessions.fork()` path, shows an informational
-notice and logs the Host error to the console. In that case the draft keeps the
-**visible** boundary note, because the hidden section is Host-owned.
-
-**Known limits**: the boundary registry is a derived in-process cache, so a DSH
-restart drops the hidden boundary for side chats created before it (the draft and
-Session remain). Host-side fork has no `increaseTitle`, so the child's list title
-is the Host default while its tab chip uses the selection's first line. The
-`maxDepth` / `recentLimit` knobs are still Client constants (batch C).
+**Known limits**: `maxDepth` / `recentLimit` are still Client constants (batch C).
+The `side-chat-fork` session command remains registered for compatibility but is
+no longer used by the Web UI — a session command writes `command/run` /
+`command/done` into the source Session log.
 
 ## Differences from Codex
 
 | Codex | This bundle |
 | --- | --- |
-| Hidden developer/system boundary between inherited history and the new question | A **visible** note in the prefilled draft (hidden boundary is batch B) |
+| Hidden developer/system boundary between inherited history and the new question | A **hidden** system-prompt section on forked Sessions (batch B) |
 | Ephemeral side thread discarded on close | A **persistent** Session in the list |
 | Only new turns after the boundary are shown | Inherited history is visible in the child Session |
 | `chatgpt.addToThread` | The same floating surface's **Quote in current chat** action (plus the built-in drag-selection quote) |

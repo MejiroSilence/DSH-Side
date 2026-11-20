@@ -233,7 +233,7 @@ test('plugin face exports inject, apply and the pure helpers', () => {
   assert.equal(typeof face.apply, 'function');
   for (const key of [
     'encodeAddress', 'parseAddress', 'capText', 'quoteBlock', 'firstLine',
-    'buildOpeningDraft', 'admitInteraction', 'waitForAbort',
+    'buildOpeningDraft', 'buildQuoteDraft', 'admitInteraction', 'waitForAbort',
     'isRecentEntry', 'sanitizeRecent', 'addRecent', 'removeRecent', 'depthFor',
   ]) {
     assert.equal(typeof helpers[key], 'function', `${key} must be exported`);
@@ -474,7 +474,8 @@ test('side chat action forks, opens a tab and prefills the draft exactly once', 
   assert.equal(first.value.ok, true);
   assert.equal(first.value.value.child, 'child-1');
   assert.equal(captured.draftInits.length, 1, 'draft is initialized while the tab holds the reference');
-  assert.equal(captured.draftInits[0].options.prompt, '> selected text\n\nt:draft.boundary');
+  assert.equal(captured.draftInits[0].options.prompt, '> selected text',
+    'the draft contains only the quote; the boundary is a hidden Host section');
   assert.equal(captured.draftInits[0].options.whenDraftExists, 'append');
 
   controller.abort();
@@ -498,18 +499,10 @@ test('resource provider rejects an invalid address', async () => {
   assert.equal(captured.released, 0);
 });
 
-function commandFailure(code, reason) {
-  return async () => ({
-    ok: true,
-    value: { result: { kind: 'error', text: JSON.stringify({ code, reason }) } },
-  });
-}
-
-test('both fork paths failing shows a localized notice and opens no tab', async () => {
+test('fork failure shows a localized notice and opens no tab', async () => {
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
-  ctx.remote.commands.execute = commandFailure('session/fork-unavailable', 'fork unavailable');
-  ctx.sessions.fork = async () => { throw new Error('client fork unavailable'); };
+  ctx.sessions.fork = async () => { throw new Error('fork unavailable'); };
   const actions = findActions(captured);
   const buttons = actions.component(actionProps(captured)).children[1].children;
   buttons[1].props.onClick();
@@ -525,7 +518,12 @@ test('both fork paths failing shows a localized notice and opens no tab', async 
 test('migration-required fork failure uses the migration-specific message', async () => {
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
-  ctx.remote.commands.execute = commandFailure('session/migration-required', 'migration required');
+  ctx.sessions.fork = async () => {
+    const error = new Error('migration required');
+    error.name = 'SessionForkError';
+    error.rpcError = { code: 'session/migration-required' };
+    throw error;
+  };
   const actions = findActions(captured);
   const buttons = actions.component(actionProps(captured)).children[1].children;
   buttons[1].props.onClick();
@@ -744,7 +742,8 @@ test('a retry restores the selected context instead of opening an empty draft', 
   const iterator = provider.open(captured.opened[0].address, { signal: new AbortController().signal });
   await iterator.next();
   assert.equal(captured.draftInits.length, 1, 'the staged prompt is restored');
-  assert.equal(captured.draftInits[0].options.prompt, '> selected text\n\nt:draft.boundary');
+  assert.equal(captured.draftInits[0].options.prompt, '> selected text',
+    'the draft contains only the quote; the boundary is a hidden Host section');
   await iterator.return();
 });
 
@@ -762,8 +761,8 @@ test('depth is not double-counted across a second-level fork', async () => {
 test('/side is guarded against concurrent forks', async () => {
   plugin.resetStorage();
   const { ctx, captured } = createFakeCtx();
-  const slow = ctx.remote.commands.execute;
-  ctx.remote.commands.execute = async (...args) => {
+  const slow = ctx.sessions.fork;
+  ctx.sessions.fork = async (...args) => {
     await new Promise(resolve => { setTimeout(resolve, 10); });
     return slow(...args);
   };
@@ -775,24 +774,31 @@ test('/side is guarded against concurrent forks', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// v2 batch B: the Host operation is the single source of fork + draft
+// v2 batch B: clean draft + hidden Host boundary, no Client->Host RPC
 // ---------------------------------------------------------------------------
 
-test('openSideChat calls the Host fork command and refreshes the catalog', async () => {
+test('buildQuoteDraft contains only the quote, never the visible boundary', () => {
+  const t = key => `T(${key})`;
+  assert.equal(helpers.buildQuoteDraft('alpha\nbeta', t), '> alpha\n> beta');
+  assert.equal(helpers.buildQuoteDraft('', t), 'T(draft.noSelection)');
+  const truncated = helpers.buildQuoteDraft('alpha', t, true);
+  assert.equal(truncated, '> alpha\n\nT(draft.truncated)');
+  assert.ok(!truncated.includes('T(draft.boundary)'), 'no boundary text in the draft');
+});
+
+test('openSideChat forks locally and never calls a Host command', async () => {
   plugin.resetStorage();
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
   const actions = findActions(captured);
   actions.component(actionProps(captured)).children[1].children[1].props.onClick();
   await settle();
-  assert.equal(captured.executed.length, 1, 'one Host command invocation');
-  assert.equal(captured.executed[0].sessionId, 'parent-1');
-  assert.equal(captured.executed[0].payload.text, 'selected text');
-  assert.equal(captured.refreshed, 1, 'Host-side fork needs a Client catalog refresh before retain');
+  assert.equal(captured.executed.length, 0, 'no Host command invocation');
   assert.equal(captured.opened.length, 1);
+  assert.equal(captured.notices.length, 0, 'no fallback or error notice');
 });
 
-test('the Host command result drives the draft and the tab label', async () => {
+test('the staged draft holds only the quote (boundary is a hidden Host section)', async () => {
   plugin.resetStorage();
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
@@ -802,85 +808,6 @@ test('the Host command result drives the draft and the tab label', async () => {
   const provider = captured.resources[0];
   const iterator = provider.open(captured.opened[0].address, { signal: new AbortController().signal });
   await iterator.next();
-  assert.equal(captured.draftInits[0].options.prompt, '> selected text\n\nt:draft.boundary');
+  assert.equal(captured.draftInits[0].options.prompt, '> selected text');
   await iterator.return();
-});
-
-test('a Host successNotice produces an informational notice', async () => {
-  plugin.resetStorage();
-  const { ctx, captured } = createFakeCtx();
-  const original = ctx.remote.commands.execute;
-  ctx.remote.commands.execute = async (...args) => {
-    const response = await original(...args);
-    const value = JSON.parse(response.value.result.text);
-    return {
-      ok: true,
-      value: { result: { kind: 'success', text: JSON.stringify({ ...value, successNotice: true }) } },
-    };
-  };
-  face.apply(ctx);
-  captured.commands[0].ui.run({ sessionId: 'parent-1' });
-  await settle();
-  assert.ok(captured.notices.some(notice => notice.level === 'info'
-    && notice.text === 't:notice.opened'));
-});
-
-test('the Client reads CommandResult from RemoteResult.value.result (regression)', async () => {
-  plugin.resetStorage();
-  const { ctx, captured } = createFakeCtx();
-  face.apply(ctx);
-  const actions = findActions(captured);
-  actions.component(actionProps(captured)).children[1].children[1].props.onClick();
-  await settle();
-  assert.equal(captured.opened.length, 1, 'a nested CommandResult succeeds');
-  assert.equal(captured.notices.length, 0, 'no failure notice');
-});
-
-test('a flat CommandResult without value.result is not misread (falls back)', async () => {
-  plugin.resetStorage();
-  const { ctx, captured } = createFakeCtx();
-  face.apply(ctx);
-  ctx.remote.commands.execute = async () => ({
-    ok: true,
-    value: { kind: 'success', text: '{}' },
-  });
-  const actions = findActions(captured);
-  actions.component(actionProps(captured)).children[1].children[1].props.onClick();
-  await settle();
-  assert.equal(captured.opened.length, 1, 'the Client fork fallback keeps the feature working');
-  assert.ok(captured.notices.some(notice => notice.text === 't:notice.fallback'));
-});
-
-test('a transport-level Host failure falls back to the Client fork', async () => {
-  plugin.resetStorage();
-  const { ctx, captured } = createFakeCtx();
-  face.apply(ctx);
-  ctx.remote.commands.execute = async () => ({ ok: false, error: { code: 'gateway/internal' } });
-  captured.commands[0].ui.run({ sessionId: 'parent-1' });
-  await settle();
-  assert.equal(captured.opened.length, 1, 'the feature still works');
-  assert.ok(captured.notices.some(notice => notice.level === 'info'
-    && notice.text === 't:notice.fallback'));
-});
-
-test('an unavailable remote.commands entry point falls back to the Client fork', async () => {
-  plugin.resetStorage();
-  const { ctx, captured } = createFakeCtx();
-  face.apply(ctx);
-  ctx.remote.commands = undefined;
-  captured.commands[0].ui.run({ sessionId: 'parent-1' });
-  await settle();
-  assert.equal(captured.opened.length, 1, 'no crash when the namespace is missing');
-  assert.ok(captured.notices.some(notice => notice.text === 't:notice.fallback'));
-});
-
-test('a Host command failure still reports migration-required without a fallback', async () => {
-  plugin.resetStorage();
-  const { ctx, captured } = createFakeCtx();
-  face.apply(ctx);
-  ctx.remote.commands.execute = commandFailure('session/migration-required', 'needs migration');
-  captured.commands[0].ui.run({ sessionId: 'parent-1' });
-  await settle();
-  assert.equal(captured.opened.length, 0);
-  assert.equal(captured.notices[0].text, 't:error.migration');
 });
