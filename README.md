@@ -1,5 +1,7 @@
 # Side chat (Codex-style) — DSH bundle
 
+[中文文档](README.zh.md) | English
+
 A small DSH Web plugin that adds a **Codex-style side chat** to the Chat view. Right-click a selected piece of chat text and you get two actions:
 
 | Action | What it does |
