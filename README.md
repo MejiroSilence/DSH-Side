@@ -83,6 +83,13 @@ draft and opens the tab — no second fork implementation.
   `install_bundle <path-to-checkout>` with a **new row name**, or a DSH
   restart. Client-only edits still need just a page refresh.
 
+**Fallback**: a session command writes `command/run` / `command/done` into the
+source Session log and can fail for reasons unrelated to the fork. If the Host
+entry point is missing or fails (except `session/migration-required`), the Client
+falls back to the proven `ctx.sessions.fork()` path, shows an informational
+notice and logs the Host error to the console. In that case the draft keeps the
+**visible** boundary note, because the hidden section is Host-owned.
+
 **Known limits**: the boundary registry is a derived in-process cache, so a DSH
 restart drops the hidden boundary for side chats created before it (the draft and
 Session remain). Host-side fork has no `increaseTitle`, so the child's list title

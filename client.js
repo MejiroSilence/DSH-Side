@@ -238,6 +238,7 @@ window.__ModuleLoader__.load({
       'error.open': '侧边聊天标签打开失败；已创建的子会话可从「最近的侧边聊天」重新打开。',
       'error.depth': '侧边聊天嵌套层数已达上限，请回到主会话再新建。',
       'notice.opened': '侧边聊天已创建。',
+      'notice.fallback': 'Host 入口不可用，已使用本地分叉创建（边界说明改为可见文本）。',
     };
 
     const en = {
@@ -268,6 +269,7 @@ window.__ModuleLoader__.load({
       'error.open': 'Could not open the side chat tab. The child Session can be reopened from "Recent side chats".',
       'error.depth': 'Side chat nesting limit reached. Return to the main chat to start a new one.',
       'notice.opened': 'Side chat created.',
+      'notice.fallback': 'Host entry point unavailable; created with a local fork (boundary note is visible).',
     };
 
     // The floating surface and home page are host-styled; only --dsw-alias-*
@@ -460,18 +462,66 @@ window.__ModuleLoader__.load({
         }
       }
 
+      function forkErrorMessage(error) {
+        const code = error !== null && typeof error === 'object' && error.rpcError !== undefined
+          && error.rpcError !== null ? error.rpcError.code : undefined;
+        return code === 'session/migration-required' ? t('error.migration') : t('error.fork');
+      }
+
+      /** Preferred path: the Host's single `createSideChat` operation. */
+      async function createViaHost(parent, text, depth) {
+        const executor = ctx.remote && ctx.remote.commands && ctx.remote.commands.execute;
+        if (typeof executor !== 'function') throw new Error('remote.commands.execute is unavailable');
+        const response = await executor(
+          parent,
+          `/side-chat-fork ${JSON.stringify({ text: String(text ?? ''), depth })}`,
+          [],
+        );
+        // RemoteResult<{ result: CommandResult }>: the outcome is nested under
+        // `value.result`, not `value` itself.
+        const commandResult = response.ok === true && response.value !== undefined
+          ? response.value.result
+          : undefined;
+        if (commandResult === undefined || commandResult.kind !== 'success') {
+          const failure = parseCommandPayload(commandResult === undefined ? '' : commandResult.text);
+          const error = new Error(failure.reason || 'side-chat-fork command failed');
+          error.code = failure.code || 'command-failed';
+          throw error;
+        }
+        const result = parseCommandPayload(commandResult.text);
+        if (typeof result.childSessionId !== 'string' || result.childSessionId === ''
+          || typeof result.draftText !== 'string') {
+          throw new Error('malformed side-chat-fork result');
+        }
+        return result;
+      }
+
+      /**
+       * Fallback: the Client `sessions.fork()` path proven by v1 / batch A.
+       * It cannot deliver the Host's hidden boundary, so the draft keeps the
+       * visible note. Prefer the Host path whenever it is available.
+       */
+      async function createViaClient(parent, text) {
+        const child = await ctx.sessions.fork({ sessionId: parent, increaseTitle: true });
+        const truncated = String(text ?? '').length > MAX_TEXT;
+        return {
+          childSessionId: child,
+          draftText: buildOpeningDraft(capText(text), t, truncated),
+          label: firstLine(text) || t('home.untitled'),
+          successNotice: false,
+          fallback: true,
+        };
+      }
+
       /** One fork per parent at a time; `/side` has no component-local busy state. */
       const inFlightParents = new Set();
 
       /**
-       * Create a side chat through the Host's single `createSideChat` operation
-       * (reached via the `side-chat-fork` session command; the agent tool calls
-       * the same method). The Host returns the child id, the composed draft and
-       * the label; this Client half only owns presentation: refresh the catalog,
-       * stage the draft and open the tab.
-       *
-       * `depth` is the depth of the conversation we are forking FROM. A failed
-       * tab open keeps the prompt in the recent entry so a retry restores it.
+       * Create a side chat. The Host command is tried first (one operation, two
+       * callers); if that entry point is unavailable or fails, fall back to the
+       * Client fork so the feature still works. `depth` is the depth of the
+       * conversation we are forking FROM. A failed tab open keeps the prompt in
+       * the recent entry so a retry restores it.
        */
       async function openSideChat(parent, text, onError, depth = 0) {
         if (inFlightParents.has(parent)) return false;
@@ -481,40 +531,33 @@ window.__ModuleLoader__.load({
         }
         inFlightParents.add(parent);
         try {
-          let response;
+          let result;
           try {
-            response = await ctx.remote.commands.execute(
-              parent,
-              `/side-chat-fork ${JSON.stringify({ text: String(text ?? ''), depth })}`,
-              [],
-            );
-          } catch (_error) {
-            onError(t('error.fork'));
-            return false;
+            result = await createViaHost(parent, text, depth);
+          } catch (hostError) {
+            const code = hostError !== null && typeof hostError === 'object'
+              ? hostError.code : undefined;
+            if (code === 'session/migration-required') {
+              onError(t('error.migration'));
+              return false;
+            }
+            // Keep a diagnostic so a broken Host entry point is debuggable
+            // instead of silently degrading forever.
+            console.warn('side-chat: Host fork command failed; using Client fork fallback', hostError);
+            try {
+              result = await createViaClient(parent, text);
+            } catch (forkError) {
+              onError(forkErrorMessage(forkError));
+              return false;
+            }
+            notify(parent, 'info', t('notice.fallback'));
           }
-          // RemoteResult<{ result: CommandResult }>: the command outcome is
-          // nested under `value.result`, not `value` itself.
-          const commandResult = response.ok === true && response.value !== undefined
-            ? response.value.result
-            : undefined;
-          if (commandResult === undefined || commandResult.kind !== 'success') {
-            const failure = parseCommandPayload(commandResult === undefined ? '' : commandResult.text);
-            onError(failure.code === 'session/migration-required'
-              ? t('error.migration')
-              : t('error.fork'));
-            return false;
-          }
-          const result = parseCommandPayload(commandResult.text);
           const child = result.childSessionId;
-          if (typeof child !== 'string' || child === ''
-            || typeof result.draftText !== 'string') {
-            onError(t('error.fork'));
-            return false;
-          }
           const label = typeof result.label === 'string' && result.label !== ''
             ? result.label : t('home.untitled');
           // A Host-side fork does not update the Client catalog; refresh before
-          // the resource provider calls sessions.retain(child).
+          // the resource provider calls sessions.retain(child). The Client fork
+          // already publishes the child, but a refresh is harmless there.
           try {
             await ctx.sessions.refresh();
           } catch (_error) {
@@ -834,7 +877,7 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'locale', 'sessions', 'uiConversation', 'sidebarRight', 'conversation'],
+      inject: ['slots', 'locale', 'sessions', 'uiConversation', 'sidebarRight', 'conversation', 'remote'],
       apply,
       helpers: {
         encodeAddress,

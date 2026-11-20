@@ -69,6 +69,8 @@ Host 半部现在有实际注册，遵循「一次操作两个调用者」：
 - **行改名为 `side-chat-v2`**，以让 Host 模块重新加载（Host 模块按行 specifier 缓存）。`list_plugins` 现在显示 `include:side-chat-v2`；Client 模块 id、资源协议、tab kind、interaction id、地址格式都不变。
 - **改 Host 代码**现在需要 `remove_bundle @local/dsh-side-chat` → `install_bundle <path-to-checkout>` 且**换一个新行名**，或重启 DSH。只改 Client 仍是刷新页面即可。
 
+**降级路径**：session command 会往来源 Session 的日志写 `command/run` / `command/done`，也可能因与 fork 无关的原因失败。若 Host 入口缺失或失败（`session/migration-required` 除外），Client 会回退到已验证的 `ctx.sessions.fork()`，显示一条 info 提示，并把 Host 错误打到控制台。此时草稿保留**可见**的边界说明，因为隐藏 section 属于 Host。
+
 **已知限制**：边界登记表是进程内的派生缓存，DSH 重启后此前创建的侧边聊天会丢失隐藏边界（草稿与 Session 仍在）。Host 侧 fork 没有 `increaseTitle`，所以会话列表里子会话是默认标题，而标签 chip 用选段首行。`maxDepth` / `recentLimit` 仍是 Client 常量（批次 C）。
 
 ## 与 Codex 的差异

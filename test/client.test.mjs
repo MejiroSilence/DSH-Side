@@ -505,10 +505,11 @@ function commandFailure(code, reason) {
   });
 }
 
-test('fork failure shows a localized notice and opens no tab', async () => {
+test('both fork paths failing shows a localized notice and opens no tab', async () => {
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
   ctx.remote.commands.execute = commandFailure('session/fork-unavailable', 'fork unavailable');
+  ctx.sessions.fork = async () => { throw new Error('client fork unavailable'); };
   const actions = findActions(captured);
   const buttons = actions.component(actionProps(captured)).children[1].children;
   buttons[1].props.onClick();
@@ -517,7 +518,6 @@ test('fork failure shows a localized notice and opens no tab', async () => {
   assert.equal(captured.opened.length, 0, 'no empty tab on failure');
   assert.equal(captured.cleared, 0, 'selection is kept on failure');
   assert.equal(captured.dismissed, 0);
-  assert.equal(captured.notices.length, 1);
   assert.equal(captured.notices[0].level, 'error');
   assert.equal(captured.notices[0].text, 't:error.fork');
 });
@@ -836,7 +836,7 @@ test('the Client reads CommandResult from RemoteResult.value.result (regression)
   assert.equal(captured.notices.length, 0, 'no failure notice');
 });
 
-test('a flat CommandResult without value.result is rejected, not misread', async () => {
+test('a flat CommandResult without value.result is not misread (falls back)', async () => {
   plugin.resetStorage();
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
@@ -847,17 +847,40 @@ test('a flat CommandResult without value.result is rejected, not misread', async
   const actions = findActions(captured);
   actions.component(actionProps(captured)).children[1].children[1].props.onClick();
   await settle();
-  assert.equal(captured.opened.length, 0);
-  assert.equal(captured.notices[0].text, 't:error.fork');
+  assert.equal(captured.opened.length, 1, 'the Client fork fallback keeps the feature working');
+  assert.ok(captured.notices.some(notice => notice.text === 't:notice.fallback'));
 });
 
-test('a transport-level command failure stays localized and opens no tab', async () => {
+test('a transport-level Host failure falls back to the Client fork', async () => {
   plugin.resetStorage();
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
   ctx.remote.commands.execute = async () => ({ ok: false, error: { code: 'gateway/internal' } });
   captured.commands[0].ui.run({ sessionId: 'parent-1' });
   await settle();
+  assert.equal(captured.opened.length, 1, 'the feature still works');
+  assert.ok(captured.notices.some(notice => notice.level === 'info'
+    && notice.text === 't:notice.fallback'));
+});
+
+test('an unavailable remote.commands entry point falls back to the Client fork', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  ctx.remote.commands = undefined;
+  captured.commands[0].ui.run({ sessionId: 'parent-1' });
+  await settle();
+  assert.equal(captured.opened.length, 1, 'no crash when the namespace is missing');
+  assert.ok(captured.notices.some(notice => notice.text === 't:notice.fallback'));
+});
+
+test('a Host command failure still reports migration-required without a fallback', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  ctx.remote.commands.execute = commandFailure('session/migration-required', 'needs migration');
+  captured.commands[0].ui.run({ sessionId: 'parent-1' });
+  await settle();
   assert.equal(captured.opened.length, 0);
-  assert.equal(captured.notices[0].text, 't:error.fork');
+  assert.equal(captured.notices[0].text, 't:error.migration');
 });
