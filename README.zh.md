@@ -53,6 +53,24 @@ plugin_manager action=install_bundle target=<path-to-checkout>
 - 打开标签失败时会把该子会话**连同尚未写入的草稿**一起记录，从首页重试会恢复原来的引用选段，而不是打开一个空白草稿；重试成功后草稿记录会被清除。
 - 批次 A **只改 Client 半部**：不动 Host、不新增 Config schema、不新增 Session 事件、不换行名，刷新页面即可生效。
 
+## v2 批次 B（当前版本）
+
+Host 半部现在有实际注册，遵循「一次操作两个调用者」：
+
+| 调用者 | 路径 |
+| --- | --- |
+| Web UI | `ctx.remote.commands.execute(parent, '/side-chat-fork …')` → `side-chat-fork` session command → `createSideChat()` |
+| Agent | `side_chat_create` 工具 → **同一个** `createSideChat()` |
+
+`createSideChat()`（在 `index.js` 里）是唯一会 fork Session（`ctx.sessionController.fork`）、拼装草稿、登记隐藏边界的地方。Client 半部只负责刷新会话目录、暂存返回的草稿、打开标签——没有第二份 fork 逻辑。
+
+- **隐藏的 developer 边界**：`agent/created` 在每个 agent 的作用域上下文里安装 `ctx.systemPrompt.section()`；`text()` 读取为该子会话登记的边界，因此 `hiddenBoundary` 开启时草稿里不再有可见的边界说明。注册是双 owner（`agent.ctx` fiber + 插件自己的 effect）。不新增 Session 事件类型。
+- **Config**（写在 `cordis.patch.yml` 行的 `config`）：`hiddenBoundary`（默认 `true`）、`successNotice`（默认 `false`）、`boundaryText`（覆盖 developer 文案）。关掉 `hiddenBoundary` 会回退到 v1 的可见说明。
+- **行改名为 `side-chat-v2`**，以让 Host 模块重新加载（Host 模块按行 specifier 缓存）。`list_plugins` 现在显示 `include:side-chat-v2`；Client 模块 id、资源协议、tab kind、interaction id、地址格式都不变。
+- **改 Host 代码**现在需要 `remove_bundle @local/dsh-side-chat` → `install_bundle <path-to-checkout>` 且**换一个新行名**，或重启 DSH。只改 Client 仍是刷新页面即可。
+
+**已知限制**：边界登记表是进程内的派生缓存，DSH 重启后此前创建的侧边聊天会丢失隐藏边界（草稿与 Session 仍在）。Host 侧 fork 没有 `increaseTitle`，所以会话列表里子会话是默认标题，而标签 chip 用选段首行。`maxDepth` / `recentLimit` 仍是 Client 常量（批次 C）。
+
 ## 与 Codex 的差异
 
 | Codex | 本插件 |
@@ -63,7 +81,7 @@ plugin_manager action=install_bundle target=<path-to-checkout>
 | `chatgpt.addToThread` | 同一浮层的「引用到当前聊天」动作（加上内置拖选引用） |
 | `/side` 命令、侧栏选择器、agent 工具 | `/side` + 引导卡片 + 首页（批次 A）；agent 工具属批次 B |
 
-仍**未实现**（见 [PLAN.v2.md](PLAN.v2.md)）：隐藏 system prompt 注入、Host service + agent tool、Config schema、成功提示开关、子会话标题定制、更多语言、关标签自动归档、只显示边界之后的新回合、发布到 npm / 插件市场。
+仍**未实现**（见 [PLAN.v2.md](PLAN.v2.md)）：子会话标题定制、更多语言、关标签自动归档、只显示边界之后的新回合、发布到 npm / 插件市场。批次 C 还包括 `maxDepth` / `recentLimit` 的 Config 化，以及隐藏边界跨重启的持久化。
 
 ## 交互说明与当前限制
 
@@ -81,8 +99,9 @@ plugin_manager action=install_bundle target=<path-to-checkout>
 
 ## 开发注意
 
-- **Host 半部**（`index.js`）是空的 `apply()`。全部行为在 Client 半部，所以改 `client.js` 只需**刷新页面**（只有当 DSH checkout 里 `pnpm run dev:web` 监视器运行时 HMR 才会自动生效）。
-- 改 **Host 半部**需要重启 DSH，或 `remove_bundle` + `install_bundle` 且**换一个新的行名**，因为 Host 模块按行 specifier 缓存。
+- **Host 半部**（`index.js`）负责创建操作、隐藏 prompt section、Config schema 与 agent 工具；**Client 半部**（`client.js`）负责全部视图：浮层、首页、最近列表、标签体、资源提供者。
+- 改 `client.js` 只需**刷新页面**（只有当 DSH checkout 里 `pnpm run dev:web` 监视器运行时 HMR 才会自动生效）。
+- 改 `index.js` / `cordis.patch.yml` 需要重启 DSH，或 `remove_bundle` + `install_bundle` 且**换一个新行名**，因为 Host 模块按行 specifier 缓存。
 - 不要手工改 `$DSH_PROFILE_DIR/package.json` 或 `cordis.patch.yml`，也不要在 profile 目录跑 `pnpm`；这些步骤由 `install_bundle` 负责。
 - Client 模块不 `require` 任何 DSH Client 包、不向 `document.body` 追加节点、不加全局 DOM 监听、不新增 Session 事件类型。所有注册（locale、interaction、resource provider、tab 类型、slot 注入）都在 `ctx.effect` / `ctx.inject` 生命周期内，禁用插件即全部撤销。
 - 在本目录运行 `ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" --check client.js` 与 `--test test/*.test.mjs` 校验语法和纯函数。

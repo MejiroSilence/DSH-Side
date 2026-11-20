@@ -1,6 +1,6 @@
 # 计划 v2：Codex 风格侧边聊天（可发现性 / 可恢复性 / 隐藏边界）
 
-> **文档状态**：本文件是 v2 的独立计划稿（2026-11-20），由 v1 验收通过后的复盘与 UX 评审结论整理而成。**尚未实现；未改动任何 v1 文件；未对 profile 做任何写操作。**
+> **文档状态**：本文件是 v2 的独立计划稿（2026-11-20），由 v1 验收通过后的复盘与 UX 评审结论整理而成。**批次 A（纯 Client）与批次 B（Host 半部）已实现并通过静态/单测验证；批次 C 未实现。** 批次 B 按用户决定采用「全量：fork 迁到 Host」方案，`index.js` 不再是空 `apply()`，Host 行改名为 `side-chat-v2`，需要 `remove_bundle` + `install_bundle` 生效。
 > **前置**：v1 已完成，[PLAN.md](PLAN.md) 第 6 节全部验收通过（静态检查、18/18 单测、`application: applied`、6 项手工流程、控制台/明暗主题/横向溢出、禁用后入口消失、UX 评审及 6 项修复）。仓库提交 `f4d6580`，`git status` 干净。
 > **项目根目录**：`<path-to-checkout>`（bundle 以 link 方式装在当前 `desktop` profile，仓库即真源）。
 > **运行环境**：`@deepseek-ai/dsh` **0.2.2-rc.5**，`DSH_PROFILE=desktop`，Web bundle 已启用。v2 仍需遵守 `dsh-doc` 技能的 `references/locate-docs.md`：以运行安装为准，实现时逐项复核 API。

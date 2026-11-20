@@ -53,6 +53,42 @@ Rollback: `plugin_manager action=remove_bundle target=@local/dsh-side-chat`, the
 - A failed tab open still records the child **together with its staged prompt**, so retrying from the home page restores the original quoted selection instead of opening an empty draft. The prompt is cleared once the retry succeeds.
 - Batch A is **Client-only**: no Host changes, no Config schema, no new Session events, no new row name. A page refresh is enough.
 
+## v2 batch B (current)
+
+The Host half is now real. One operation, two callers:
+
+| Caller | Path |
+| --- | --- |
+| Web UI | `ctx.remote.commands.execute(parent, '/side-chat-fork …')` → `side-chat-fork` session command → `createSideChat()` |
+| Agent | `side_chat_create` tool → the **same** `createSideChat()` |
+
+`createSideChat()` (in `index.js`) is the only place that forks a Session
+(`ctx.sessionController.fork`), composes the draft text and registers the hidden
+boundary. The Client half only refreshes the session catalog, stages the returned
+draft and opens the tab — no second fork implementation.
+
+- **Hidden developer boundary**: `agent/created` installs a `ctx.systemPrompt.section()`
+  on each agent's scoped context. Its `text()` reads the boundary registered for
+  that side-chat child, so the draft no longer carries the visible boundary note
+  when `hiddenBoundary` is on. Registrations are double-owned (`agent.ctx` fiber
+  plus the plugin's own effect). No new Session event types are written.
+- **Config** (in `cordis.patch.yml` under the row's `config`): `hiddenBoundary`
+  (default `true`), `successNotice` (default `false`), `boundaryText` (override
+  the developer text). Turning `hiddenBoundary` off restores the v1 visible note.
+- **Row renamed** to `side-chat-v2` so the Host module is loaded fresh (Host
+  modules are cached by row specifier). `list_plugins` now shows
+  `include:side-chat-v2`; the Client module id, resource protocol, tab kinds,
+  interaction id and address format are unchanged.
+- **Changing Host code** now needs `remove_bundle @local/dsh-side-chat` →
+  `install_bundle <path-to-checkout>` with a **new row name**, or a DSH
+  restart. Client-only edits still need just a page refresh.
+
+**Known limits**: the boundary registry is a derived in-process cache, so a DSH
+restart drops the hidden boundary for side chats created before it (the draft and
+Session remain). Host-side fork has no `increaseTitle`, so the child's list title
+is the Host default while its tab chip uses the selection's first line. The
+`maxDepth` / `recentLimit` knobs are still Client constants (batch C).
+
 ## Differences from Codex
 
 | Codex | This bundle |
@@ -63,7 +99,7 @@ Rollback: `plugin_manager action=remove_bundle target=@local/dsh-side-chat`, the
 | `chatgpt.addToThread` | The same floating surface's **Quote in current chat** action (plus the built-in drag-selection quote) |
 | `/side` command, side-chat picker, agent tool | `/side` + guide capsule + home page (batch A); agent tool is batch B |
 
-Still **not** implemented (see [PLAN.v2.md](PLAN.v2.md)): hidden system-prompt injection, Host service + agent tool, Config schema, a success-notice toggle, custom child titles, more languages, auto-archiving on close, boundary-only turn filtering, publishing to npm / a plugin market.
+Still **not** implemented (see [PLAN.v2.md](PLAN.v2.md)): custom child titles, more languages, auto-archiving on close, boundary-only turn filtering, publishing to npm / a plugin market. Batch C also covers `maxDepth` / `recentLimit` Config and persisting the hidden boundary across restarts.
 
 ## UX notes and current limitations
 
@@ -81,8 +117,9 @@ Still **not** implemented (see [PLAN.v2.md](PLAN.v2.md)): hidden system-prompt i
 
 ## Development notes
 
-- **Host half** (`index.js`) is an empty `apply()`. All behavior is in the Client half, so changes to `client.js` only require a **page refresh** (HMR applies automatically only while `pnpm run dev:web` is running from the DSH checkout).
-- Changes to the **Host half** need a DSH restart, or `remove_bundle` + `install_bundle` with a **new row name**, because Host modules are cached by row specifier.
+- **Host half** (`index.js`) owns the create operation, the hidden prompt section, the Config schema and the agent tool. **Client half** (`client.js`) owns every view: the floating surface, the home page, the recent list, the tab body and the resource provider.
+- Changes to `client.js` only require a **page refresh** (HMR applies automatically only while `pnpm run dev:web` is running from the DSH checkout).
+- Changes to `index.js` / `cordis.patch.yml` need a DSH restart, or `remove_bundle` + `install_bundle` with a **new row name**, because Host modules are cached by row specifier.
 - Do not edit `$DSH_PROFILE_DIR/package.json` or `cordis.patch.yml` by hand, and do not run `pnpm` in the profile directory; `install_bundle` owns those steps.
 - The Client module never `require`s a DSH Client package, never appends to `document.body`, never adds a global DOM listener, and never writes a new Session event type. Every registration (locale, interaction, resource provider, tab type, slot injections) lives inside `ctx.effect` / `ctx.inject`, so disabling the bundle removes all entries.
 - Run `ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" --check client.js` and `--test test/*.test.mjs` from this directory to validate syntax and pure helpers.

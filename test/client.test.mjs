@@ -60,6 +60,8 @@ function createFakeCtx() {
     resources: [],
     tabs: [],
     commands: [],
+    executed: [],
+    refreshed: 0,
     slotRegistrations: [],
     opened: [],
     notices: [],
@@ -91,6 +93,7 @@ function createFakeCtx() {
         release() { captured.released += 1; },
       }),
       using: async () => undefined,
+      refresh: async () => { captured.refreshed += 1; },
       list: { getSnapshot: () => ({ byId: captured.sessionRows }) },
     },
     sidebarRight: {
@@ -98,6 +101,35 @@ function createFakeCtx() {
     },
     commandUi: {
       register(contribution) { captured.commands.push(contribution); return dispose; },
+    },
+    remote: {
+      commands: {
+        async execute(sessionId, line) {
+          const payload = JSON.parse(line.replace(/^\/side-chat-fork\s*/u, ''));
+          captured.executed.push({ sessionId, payload });
+          const text = String(payload.text ?? '');
+          const label = text.trim() === ''
+            ? 't:home.untitled'
+            : text.split('\n').find(candidate => candidate.trim() !== '').trim().slice(0, 28);
+          const draftText = text.trim() === ''
+            ? 't:draft.noSelection\n\nt:draft.boundary'
+            : `> ${text}\n\nt:draft.boundary`;
+          return {
+            ok: true,
+            value: {
+              kind: 'success',
+              text: JSON.stringify({
+                ok: true,
+                childSessionId: 'child-1',
+                draftText,
+                label,
+                depth: (payload.depth ?? 0) + 1,
+                successNotice: false,
+              }),
+            },
+          };
+        },
+      },
     },
     slots: {
       inject(name, factory) {
@@ -464,10 +496,17 @@ test('resource provider rejects an invalid address', async () => {
   assert.equal(captured.released, 0);
 });
 
+function commandFailure(code, reason) {
+  return async () => ({
+    ok: true,
+    value: { kind: 'error', text: JSON.stringify({ code, reason }) },
+  });
+}
+
 test('fork failure shows a localized notice and opens no tab', async () => {
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
-  ctx.sessions.fork = async () => { throw new Error('fork unavailable'); };
+  ctx.remote.commands.execute = commandFailure('session/fork-unavailable', 'fork unavailable');
   const actions = findActions(captured);
   const buttons = actions.component(actionProps(captured)).children[1].children;
   buttons[1].props.onClick();
@@ -484,12 +523,7 @@ test('fork failure shows a localized notice and opens no tab', async () => {
 test('migration-required fork failure uses the migration-specific message', async () => {
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
-  ctx.sessions.fork = async () => {
-    const error = new Error('migration required');
-    error.name = 'SessionForkError';
-    error.rpcError = { code: 'session/migration-required' };
-    throw error;
-  };
+  ctx.remote.commands.execute = commandFailure('session/migration-required', 'migration required');
   const actions = findActions(captured);
   const buttons = actions.component(actionProps(captured)).children[1].children;
   buttons[1].props.onClick();
@@ -726,10 +760,73 @@ test('depth is not double-counted across a second-level fork', async () => {
 test('/side is guarded against concurrent forks', async () => {
   plugin.resetStorage();
   const { ctx, captured } = createFakeCtx();
-  ctx.sessions.fork = () => new Promise(resolve => { setTimeout(() => resolve('child-1'), 10); });
+  const slow = ctx.remote.commands.execute;
+  ctx.remote.commands.execute = async (...args) => {
+    await new Promise(resolve => { setTimeout(resolve, 10); });
+    return slow(...args);
+  };
   face.apply(ctx);
   captured.commands[0].ui.run({ sessionId: 'parent-1' });
   captured.commands[0].ui.run({ sessionId: 'parent-1' });
   await new Promise(resolve => { setTimeout(resolve, 40); });
   assert.equal(captured.opened.length, 1, 'only one fork/tab from two rapid /side invocations');
+});
+
+// ---------------------------------------------------------------------------
+// v2 batch B: the Host operation is the single source of fork + draft
+// ---------------------------------------------------------------------------
+
+test('openSideChat calls the Host fork command and refreshes the catalog', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const actions = findActions(captured);
+  actions.component(actionProps(captured)).children[1].children[1].props.onClick();
+  await settle();
+  assert.equal(captured.executed.length, 1, 'one Host command invocation');
+  assert.equal(captured.executed[0].sessionId, 'parent-1');
+  assert.equal(captured.executed[0].payload.text, 'selected text');
+  assert.equal(captured.refreshed, 1, 'Host-side fork needs a Client catalog refresh before retain');
+  assert.equal(captured.opened.length, 1);
+});
+
+test('the Host command result drives the draft and the tab label', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const actions = findActions(captured);
+  actions.component(actionProps(captured)).children[1].children[1].props.onClick();
+  await settle();
+  const provider = captured.resources[0];
+  const iterator = provider.open(captured.opened[0].address, { signal: new AbortController().signal });
+  await iterator.next();
+  assert.equal(captured.draftInits[0].options.prompt, '> selected text\n\nt:draft.boundary');
+  await iterator.return();
+});
+
+test('a Host successNotice produces an informational notice', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  const original = ctx.remote.commands.execute;
+  ctx.remote.commands.execute = async (...args) => {
+    const response = await original(...args);
+    const value = JSON.parse(response.value.text);
+    return { ok: true, value: { kind: 'success', text: JSON.stringify({ ...value, successNotice: true }) } };
+  };
+  face.apply(ctx);
+  captured.commands[0].ui.run({ sessionId: 'parent-1' });
+  await settle();
+  assert.ok(captured.notices.some(notice => notice.level === 'info'
+    && notice.text === 't:notice.opened'));
+});
+
+test('a transport-level command failure stays localized and opens no tab', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  ctx.remote.commands.execute = async () => ({ ok: false, error: { code: 'gateway/internal' } });
+  captured.commands[0].ui.run({ sessionId: 'parent-1' });
+  await settle();
+  assert.equal(captured.opened.length, 0);
+  assert.equal(captured.notices[0].text, 't:error.fork');
 });

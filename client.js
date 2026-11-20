@@ -237,6 +237,7 @@ window.__ModuleLoader__.load({
       'error.migration': '请先打开原会话完成迁移，再创建侧边聊天。',
       'error.open': '侧边聊天标签打开失败；已创建的子会话可从「最近的侧边聊天」重新打开。',
       'error.depth': '侧边聊天嵌套层数已达上限，请回到主会话再新建。',
+      'notice.opened': '侧边聊天已创建。',
     };
 
     const en = {
@@ -266,6 +267,7 @@ window.__ModuleLoader__.load({
       'error.migration': 'Open the original chat once to finish migration before creating a side chat.',
       'error.open': 'Could not open the side chat tab. The child Session can be reopened from "Recent side chats".',
       'error.depth': 'Side chat nesting limit reached. Return to the main chat to start a new one.',
+      'notice.opened': 'Side chat created.',
     };
 
     // The floating surface and home page are host-styled; only --dsw-alias-*
@@ -448,24 +450,28 @@ window.__ModuleLoader__.load({
         notify(sessionId, 'error', message);
       }
 
-      function forkErrorMessage(error) {
-        if (error !== null && typeof error === 'object'
-          && error.name === 'SessionForkError'
-          && error.rpcError !== undefined && error.rpcError !== null
-          && error.rpcError.code === 'session/migration-required') {
-          return t('error.migration');
+      /** Parse the Host command's structured result/error payload. */
+      function parseCommandPayload(text) {
+        try {
+          const value = JSON.parse(String(text ?? ''));
+          return value !== null && typeof value === 'object' ? value : {};
+        } catch (_error) {
+          return {};
         }
-        return t('error.fork');
       }
 
       /** One fork per parent at a time; `/side` has no component-local busy state. */
       const inFlightParents = new Set();
 
       /**
-       * Fork one child, stage its opening draft, open its tab, and remember it.
-       * `depth` is the depth of the conversation we are forking FROM.
-       * A failed tab open keeps the prompt inside the recent entry so a retry
-       * restores the selected context instead of opening an empty draft.
+       * Create a side chat through the Host's single `createSideChat` operation
+       * (reached via the `side-chat-fork` session command; the agent tool calls
+       * the same method). The Host returns the child id, the composed draft and
+       * the label; this Client half only owns presentation: refresh the catalog,
+       * stage the draft and open the tab.
+       *
+       * `depth` is the depth of the conversation we are forking FROM. A failed
+       * tab open keeps the prompt in the recent entry so a retry restores it.
        */
       async function openSideChat(parent, text, onError, depth = 0) {
         if (inFlightParents.has(parent)) return false;
@@ -475,17 +481,42 @@ window.__ModuleLoader__.load({
         }
         inFlightParents.add(parent);
         try {
-          let child;
+          let response;
           try {
-            // Omitting `atSeq` forks from the latest completed-turn prefix.
-            child = await ctx.sessions.fork({ sessionId: parent, increaseTitle: true });
-          } catch (error) {
-            onError(forkErrorMessage(error));
+            response = await ctx.remote.commands.execute(
+              parent,
+              `/side-chat-fork ${JSON.stringify({ text: String(text ?? ''), depth })}`,
+              [],
+            );
+          } catch (_error) {
+            onError(t('error.fork'));
             return false;
           }
-          const truncated = String(text ?? '').length > MAX_TEXT;
-          const prompt = buildOpeningDraft(capText(text), t, truncated);
-          const label = firstLine(text) || t('home.untitled');
+          const commandResult = response.ok === true ? response.value : undefined;
+          if (commandResult === undefined || commandResult.kind !== 'success') {
+            const failure = parseCommandPayload(commandResult === undefined ? '' : commandResult.text);
+            onError(failure.code === 'session/migration-required'
+              ? t('error.migration')
+              : t('error.fork'));
+            return false;
+          }
+          const result = parseCommandPayload(commandResult.text);
+          const child = result.childSessionId;
+          if (typeof child !== 'string' || child === ''
+            || typeof result.draftText !== 'string') {
+            onError(t('error.fork'));
+            return false;
+          }
+          const label = typeof result.label === 'string' && result.label !== ''
+            ? result.label : t('home.untitled');
+          // A Host-side fork does not update the Client catalog; refresh before
+          // the resource provider calls sessions.retain(child).
+          try {
+            await ctx.sessions.refresh();
+          } catch (_error) {
+            console.warn('side-chat: session catalog refresh failed', _error);
+          }
+          const prompt = result.draftText;
           const address = encodeAddress({ child, parent, label, depth: depth + 1 });
           pendingDrafts.set(child, prompt);
           const entry = {
@@ -494,6 +525,7 @@ window.__ModuleLoader__.load({
           try {
             ctx.sidebarRight.openResource(address, { kind: 'sidechat', preferNewPane: true });
             saveRecent(addRecent(loadRecent(), entry));
+            if (result.successNotice === true) notify(parent, 'info', t('notice.opened'));
             return true;
           } catch (_error) {
             pendingDrafts.delete(child);
