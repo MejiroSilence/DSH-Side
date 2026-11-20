@@ -35,26 +35,44 @@ Rollback: `plugin_manager action=remove_bundle target=@local/dsh-side-chat`, the
 - The tab body reuses the shared Conversation assembly (`conversation.content` with `variant: 'embedded'`) with a fixed Chat view, wrapped in a `SessionProvider` around a `sessions.retain()` reference. That reference is released when the tab closes or the plugin unloads.
 - Draft initialization happens while the tab's own reference is held, so the draft survives scope teardown and is not repeated when an existing tab is revealed again.
 
-## Differences from Codex (and v1 scope)
+## v2 batch A (current)
 
-| Codex | This bundle v1 |
+`client.js` now has four ways in, and a closed tab can be brought back side-by-side:
+
+| Entry | What it does |
 | --- | --- |
-| Hidden developer/system boundary between inherited history and the new question | A **visible** note in the prefilled draft |
+| **Right-click inside a selection** | The original two-button surface (Quote / Ask in side chat) |
+| **`/side`** | Slash command that forks a blank side chat from the current session |
+| **Right-Sidebar guide capsule** | Opens the **Side chat** home page |
+| **Home page** | Explains the flows, starts a blank side chat, lists **Recent side chats** |
+
+- **Recent side chats** live in browser `localStorage` (`dsh.sidechat.recent`, 20 entries max). Closing a tab does not delete the child; clicking an entry calls `openResource` on the **same address**, so the existing tab is revealed — no new fork, no duplicate draft. An entry whose child is no longer in the session list is removed with a localized notice.
+- `/side` and the home page create a blank side chat: the draft has a localized "no selection" line plus the boundary note, no empty blockquote.
+- **Recursion is capped at 3 levels** (`depth` in the address; v1 addresses parse as depth 0, so old tabs still work). Forking from a too-deep side chat shows a localized error instead of creating a grandchild.
+- **Truncated selections get a visible note** after the boundary, never inside the quoted text.
+- A failed tab open still records the child **together with its staged prompt**, so retrying from the home page restores the original quoted selection instead of opening an empty draft. The prompt is cleared once the retry succeeds.
+- Batch A is **Client-only**: no Host changes, no Config schema, no new Session events, no new row name. A page refresh is enough.
+
+## Differences from Codex
+
+| Codex | This bundle |
+| --- | --- |
+| Hidden developer/system boundary between inherited history and the new question | A **visible** note in the prefilled draft (hidden boundary is batch B) |
 | Ephemeral side thread discarded on close | A **persistent** Session in the list |
 | Only new turns after the boundary are shown | Inherited history is visible in the child Session |
 | `chatgpt.addToThread` | The same floating surface's **Quote in current chat** action (plus the built-in drag-selection quote) |
-| `/side` command, side-chat picker, agent tool | Not in v1 |
+| `/side` command, side-chat picker, agent tool | `/side` + guide capsule + home page (batch A); agent tool is batch B |
 
-Also **not** in v1: hidden system-prompt injection (would need a Host `agent/created` listener, `ctx.systemPrompt.section()`, a Host service and an agent tool so one operation has two callers), auto-archiving on tab close, custom titles, extra languages, publishing to npm or a plugin market.
+Still **not** implemented (see [PLAN.v2.md](PLAN.v2.md)): hidden system-prompt injection, Host service + agent tool, Config schema, a success-notice toggle, custom child titles, more languages, auto-archiving on close, boundary-only turn filtering, publishing to npm / a plugin market.
 
-## UX notes and known v1 limitations
+## UX notes and current limitations
 
-- **The custom surface appears only when you right-click *inside the selected text*.** Right-clicking outside the selection keeps the browser's native context menu. When the plugin claims the gesture it calls `preventDefault()` to suppress the native menu, so use Cmd/Ctrl+C or drag-selection to copy. The `selection` (drag) gesture deliberately still belongs to the built-in **Quote text** action — that coexistence is why there is no in-app hint, slash command or sidebar guide card in v1. The `meta.description` and this README are the only discovery path.
-- **While `sessions.fork()` is in flight** the two buttons are disabled and the second reads "Creating side chat…". On failure a localized error notice appears on the parent composer, no empty tab opens, and the selection stays. On success the surface dismisses and the tab opens (there is no extra success toast).
-- **A closed tab cannot be reopened side-by-side in v1.** The child is a normal Session and can be opened in the main view; there is no "recently closed side chats" affordance yet.
-- **If tab opening fails after a successful fork**, the already-created child remains in the session list (the error text says so). The tab body itself shows localized loading and failure states instead of an endless "Opening side chat…".
-- **Selections are capped at 8000 characters** (surrogate pairs are never split in half). There is no visible "truncated" marker in the prefilled draft.
-- **Right-clicking inside a side chat works too**, so a grandchild side chat can be created; v1 does not limit that recursion.
+- **Right-click still only works inside the selection rect**; outside it the native browser menu stays. Claiming the gesture calls `preventDefault()`, so copy with Cmd/Ctrl+C or drag-selection. Drag-selection still belongs to the built-in **Quote text**.
+- **While `sessions.fork()` is in flight** the two buttons are disabled and the second reads "Creating side chat…". On failure a localized error notice appears on the parent composer, no empty tab opens, and the selection stays. On success the surface dismisses and the tab opens — there is still **no success toast** (a `successNotice` Config switch is planned for batch B).
+- The child is a **normal persistent Session**; closing the tab does not delete it. It can now be reopened side-by-side from Recent side chats, but there is no auto-archiving.
+- The tab body shows localized loading and failure states instead of an endless "Opening side chat…".
+- **Selections are capped at 8000 characters** (surrogate pairs are never split in half); a visible truncated note is appended.
+- Right-clicking inside a side chat still works, up to the depth limit.
 - The boundary note in the draft is model-facing instruction text only. The "nothing is sent automatically" guarantee lives in `meta.description` and the README, not in the draft that gets sent.
 
 ## Differences from `dsh-select-ask`
@@ -71,4 +89,4 @@ Also **not** in v1: hidden system-prompt injection (would need a Host `agent/cre
 
 ## Files
 
-`package.json`, `cordis.patch.yml`, `index.js`, `client.js`, `locale/en.json`, `locale/zh.json`, `icon.svg`, `README.md`, `README.zh.md`, `test/client.test.mjs`, `.gitignore`, `PLAN.md`.
+`package.json`, `cordis.patch.yml`, `index.js`, `client.js`, `locale/en.json`, `locale/zh.json`, `icon.svg`, `README.md`, `README.zh.md`, `test/client.test.mjs`, `.gitignore`, `PLAN.md`, `PLAN.v2.md`.

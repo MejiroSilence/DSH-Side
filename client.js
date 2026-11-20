@@ -6,6 +6,11 @@
  * quote into the current composer, or fork a real child Session and show its
  * Chat in a right-Sidebar tab. Nothing is sent automatically.
  *
+ * v2 batch A adds three more entry points and recovery: a `/side` command, a
+ * right-Sidebar guide capsule + home page, and a "recent side chats" list that
+ * reopens a closed tab side-by-side. It also caps recursion depth, marks
+ * truncated selections, and keeps failed opens retryable.
+ *
  * The module is a lazy `window.__ModuleLoader__` factory. React comes from the
  * browser module table; no DSH Client package is required at runtime.
  */
@@ -21,21 +26,31 @@ window.__ModuleLoader__.load({
     const ADDRESS_PREFIX = 'dsh-resource://sidechat/session/';
     const ADDRESS_PATTERN = 'dsh-resource://sidechat/**';
     const MAX_TEXT = 8000;
+    // v2: the resource-only `sidechat` kind cannot be opened as a page, so the
+    // guide capsule and `/side` lead to a separate page kind.
+    const HOME_KIND = 'sidechat-home';
+    const HOME_ID = '@local/dsh-side-chat/home';
+    const RECENT_KEY = 'dsh.sidechat.recent';
+    const RECENT_LIMIT = 20;
+    const MAX_DEPTH = 3;
 
     // ---------------------------------------------------------------------
     // Pure helpers. Exported on the plugin face's `helpers` seat so the unit
     // tests exercise this exact source through `vm`.
     // ---------------------------------------------------------------------
 
-    function encodeAddress({ child, parent, label }) {
+    /** `depth` is v2-only; omitting it keeps the v1 address byte-for-byte. */
+    function encodeAddress({ child, parent, label, depth }) {
       if (child === undefined || child === null || child === ''
         || parent === undefined || parent === null || parent === '') return undefined;
       const query = new URLSearchParams();
       query.set('parent', String(parent));
       if (label !== undefined && label !== null && label !== '') query.set('label', String(label));
+      if (Number.isFinite(depth) && depth > 0) query.set('depth', String(Math.floor(depth)));
       return `${ADDRESS_PREFIX}${encodeURIComponent(String(child))}?${query.toString()}`;
     }
 
+    /** v1 addresses without `depth` parse as depth 0 (backwards compatible). */
     function parseAddress(value) {
       if (typeof value !== 'string' || value === '') return undefined;
       let url;
@@ -56,7 +71,9 @@ window.__ModuleLoader__.load({
         return undefined;
       }
       if (child === '') return undefined;
-      return { child, parent, label: url.searchParams.get('label') ?? '' };
+      const rawDepth = Number.parseInt(url.searchParams.get('depth') ?? '0', 10);
+      const depth = Number.isSafeInteger(rawDepth) && rawDepth > 0 ? rawDepth : 0;
+      return { child, parent, label: url.searchParams.get('label') ?? '', depth };
     }
 
     function capText(text, max = MAX_TEXT) {
@@ -84,8 +101,27 @@ window.__ModuleLoader__.load({
       return trimmed.length <= limit ? trimmed : `${trimmed.slice(0, limit)}…`;
     }
 
-    function buildOpeningDraft(text, t) {
-      return `${quoteBlock(text)}\n\n${t('draft.boundary')}`;
+    /**
+     * v1 text with no selection produces no blockquote; a truncated selection
+     * gets a visible note AFTER the boundary, never inside the quoted text.
+     */
+    function buildOpeningDraft(text, t, truncated = false) {
+      const value = String(text ?? '');
+      const hasQuote = value.trim() !== '';
+      const quote = hasQuote ? `${quoteBlock(value)}\n\n` : '';
+      const noSelection = hasQuote ? '' : `${t('draft.noSelection')}\n\n`;
+      const truncation = truncated ? `\n\n${t('draft.truncated')}` : '';
+      return `${noSelection}${quote}${t('draft.boundary')}${truncation}`;
+    }
+
+    /** Shared writable-Session gate for both the right-click and `/side`. */
+    function writableSession(binding) {
+      if (binding === undefined || binding === null || binding.session === undefined) return false;
+      const session = binding.session.getSnapshot();
+      if (session.removed) return false;
+      if (session.subagent !== null && session.subagent !== undefined
+        && session.subagent.address.mode !== 'continuable') return false;
+      return true;
     }
 
     /**
@@ -96,12 +132,7 @@ window.__ModuleLoader__.load({
     function admitInteraction(request, binding) {
       if (request === undefined || request === null || request.trigger !== 'contextmenu') return false;
       if (typeof request.readText !== 'function' || request.readText() === null) return false;
-      if (binding === undefined || binding === null || binding.session === undefined) return false;
-      const session = binding.session.getSnapshot();
-      if (session.removed) return false;
-      if (session.subagent !== null && session.subagent !== undefined
-        && session.subagent.address.mode !== 'continuable') return false;
-      return true;
+      return writableSession(binding);
     }
 
     function waitForAbort(signal) {
@@ -109,6 +140,70 @@ window.__ModuleLoader__.load({
       return new Promise(resolve => {
         signal.addEventListener('abort', () => { resolve(); }, { once: true });
       });
+    }
+
+    // ---------------------------------------------------------------------
+    // v2: recent side chats. Pure list functions + a localStorage-backed
+    // store. No Host storage, no new Session events, no module-level singleton
+    // holding a sessionId.
+    // ---------------------------------------------------------------------
+
+    function isRecentEntry(value) {
+      if (value === null || typeof value !== 'object'
+        || typeof value.child !== 'string' || value.child === ''
+        || typeof value.parent !== 'string' || value.parent === ''
+        || typeof value.address !== 'string'
+        || typeof value.label !== 'string'
+        || !Number.isSafeInteger(value.depth) || value.depth < 0
+        || !Number.isFinite(value.createdAt)
+        || !(value.prompt === undefined || typeof value.prompt === 'string')) return false;
+      // Cross-check the address: never validate one child and open another.
+      const parsed = parseAddress(value.address);
+      return parsed !== undefined && parsed.child === value.child && parsed.parent === value.parent;
+    }
+
+    function sanitizeRecent(list) {
+      return Array.isArray(list) ? list.filter(isRecentEntry) : [];
+    }
+
+    /** Newest first, de-duplicated by child, bounded by `limit`. */
+    function addRecent(list, entry, limit = RECENT_LIMIT) {
+      const clean = sanitizeRecent(list);
+      if (!isRecentEntry(entry)) return clean;
+      const without = clean.filter(item => item.child !== entry.child);
+      const capped = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : RECENT_LIMIT;
+      return [entry, ...without].slice(0, capped);
+    }
+
+    /**
+     * Depth of the conversation `sessionId` itself (0 for the main chat).
+     * `openSideChat` adds 1 for the new child, so this must NOT add 1 here —
+     * doing so double-counts and caps nesting at MAX_DEPTH - 1.
+     */
+    function depthFor(list, sessionId) {
+      const entry = sanitizeRecent(list).find(item => item.child === sessionId);
+      return entry === undefined ? 0 : entry.depth;
+    }
+
+    function removeRecent(list, child) {
+      return sanitizeRecent(list).filter(item => item.child !== child);
+    }
+
+    function loadRecent() {
+      try {
+        const raw = window.localStorage.getItem(RECENT_KEY);
+        return raw === null ? [] : sanitizeRecent(JSON.parse(raw));
+      } catch (_error) {
+        return [];
+      }
+    }
+
+    function saveRecent(list) {
+      try {
+        window.localStorage.setItem(RECENT_KEY, JSON.stringify(list));
+      } catch (_error) {
+        console.warn('side-chat: could not persist recent side chats', _error);
+      }
     }
 
     // ---------------------------------------------------------------------
@@ -123,10 +218,25 @@ window.__ModuleLoader__.load({
       'tab.title': '侧边聊天',
       'tab.loading': '正在打开侧边聊天…',
       'tab.failed': '无法打开此侧边聊天；子会话仍保留在会话列表中。',
+      'command.label': '侧边聊天',
+      'command.description': '从当前会话分叉一个新的侧边聊天（不带选段）。',
+      'guide.title': '侧边聊天',
+      'guide.description': '打开侧边聊天首页：新建侧边聊天，或重新打开最近的一个。',
+      'home.title': '侧边聊天',
+      'home.intro': '在聊天里选中文字并右键可选择「在侧边聊天中提问」，也可以输入 /side，或直接在下方新建一个空白侧边聊天。',
+      'home.new': '新建空白侧边聊天',
+      'home.recent': '最近的侧边聊天',
+      'home.empty': '还没有侧边聊天。新建一个，或从聊天里右键选段开始。',
+      'home.missing': '这个子会话已不在会话列表中，记录已移除。',
+      'home.untitled': '空白侧边聊天',
+      'home.open': '重新打开',
       'draft.boundary': '上面的引用来自主会话；继承的历史仅作参考。请在侧边聊天中回答，不要继续执行主任务、不要修改文件，除非明确要求否则不要运行工具。',
+      'draft.noSelection': '（本次没有附带选段，请在下面补充你想问的内容。）',
+      'draft.truncated': '（选段过长，已截断到 8000 字符；块引用中只包含前半部分。）',
       'error.fork': '无法创建侧边聊天，请重试。',
       'error.migration': '请先打开原会话完成迁移，再创建侧边聊天。',
-      'error.open': '侧边聊天标签打开失败；已创建的子会话仍在会话列表中，可直接打开。',
+      'error.open': '侧边聊天标签打开失败；已创建的子会话可从「最近的侧边聊天」重新打开。',
+      'error.depth': '侧边聊天嵌套层数已达上限，请回到主会话再新建。',
     };
 
     const en = {
@@ -137,14 +247,29 @@ window.__ModuleLoader__.load({
       'tab.title': 'Side chat',
       'tab.loading': 'Opening side chat…',
       'tab.failed': 'Could not open this side chat. The child Session is still in the session list.',
+      'command.label': 'Side chat',
+      'command.description': 'Fork a new side chat from this conversation without a selection.',
+      'guide.title': 'Side chat',
+      'guide.description': 'Open the side chat home page: start a new one or reopen a recent one.',
+      'home.title': 'Side chat',
+      'home.intro': 'Select text in a chat and right-click it to "Ask in side chat", type /side, or start a blank side chat below.',
+      'home.new': 'New blank side chat',
+      'home.recent': 'Recent side chats',
+      'home.empty': 'No side chats yet. Create one, or start from a right-click on selected text.',
+      'home.missing': 'That child Session is no longer in the session list; the entry was removed.',
+      'home.untitled': 'Blank side chat',
+      'home.open': 'Reopen',
       'draft.boundary': 'The quoted text above comes from the parent chat. Inherited history is for reference only. Please answer in this side chat; do not continue the parent task, do not change files, and do not run tools unless explicitly asked.',
+      'draft.noSelection': '(No selection was attached. Add what you want to ask below.)',
+      'draft.truncated': '(The selection was too long and was capped at 8000 characters; the quote contains only the first part.)',
       'error.fork': 'Could not create a side chat. Please try again.',
       'error.migration': 'Open the original chat once to finish migration before creating a side chat.',
-      'error.open': 'Could not open the side chat tab. The child Session was created and is still in the session list.',
+      'error.open': 'Could not open the side chat tab. The child Session can be reopened from "Recent side chats".',
+      'error.depth': 'Side chat nesting limit reached. Return to the main chat to start a new one.',
     };
 
-    // The floating surface is host-styled; only --dsw-alias-* theme tokens are
-    // used for color, so it inherits light/dark switching automatically.
+    // The floating surface and home page are host-styled; only --dsw-alias-*
+    // theme tokens are used for color, so they inherit light/dark switching.
     const ACTION_CSS = `
 [data-side-chat-actions] {
   display: flex;
@@ -182,6 +307,78 @@ window.__ModuleLoader__.load({
 [data-side-chat-actions] button:disabled {
   color: var(--dsw-alias-label-tertiary);
   cursor: default;
+}
+`;
+
+    const HOME_CSS = `
+[data-side-chat-home] {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: 16px;
+  overflow: auto;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-l1);
+  font: inherit;
+}
+[data-side-chat-home] h2,
+[data-side-chat-home] h3 {
+  margin: 0;
+  font: inherit;
+  font-weight: 600;
+}
+[data-side-chat-home] h2 { font-size: 1.15em; }
+[data-side-chat-home] h3 {
+  font-size: 1em;
+  color: var(--dsw-alias-label-secondary);
+}
+[data-side-chat-home] p {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+  line-height: 1.5;
+}
+[data-side-chat-home] button {
+  padding: 6px 12px;
+  border: 1px solid var(--dsw-alias-border-l3);
+  border-radius: 8px;
+  background: var(--dsw-alias-button-floating-fill);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+[data-side-chat-home] button:hover,
+[data-side-chat-home] button:focus-visible {
+  background: var(--dsw-alias-button-floating-hover);
+}
+[data-side-chat-home] button:focus-visible {
+  outline: 2px solid var(--dsw-alias-border-selected);
+  outline-offset: 1px;
+}
+[data-side-chat-home] button:disabled {
+  color: var(--dsw-alias-label-tertiary);
+  cursor: default;
+}
+[data-side-chat-home] [data-side-chat-list] {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+[data-side-chat-home] [data-side-chat-list] li {
+  min-width: 0;
+}
+[data-side-chat-home] [data-side-chat-list] button {
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 `;
 
@@ -232,19 +429,23 @@ window.__ModuleLoader__.load({
         },
       }), 'side-chat: contextmenu interaction');
 
-      /** Best-effort localized failure notice on the parent Session's composer. */
-      function notifyError(sessionId, message) {
+      /** Best-effort localized notice on the parent Session's composer. */
+      function notify(sessionId, level, message) {
         try {
           const binding = ctx.sessions.binding(sessionId);
           const conversation = ctx.get('conversation');
           if (binding !== undefined && conversation !== undefined) {
-            conversation.input.for(binding.ctx).notify('error', message);
+            conversation.input.for(binding.ctx).notify(level, message);
           }
         } catch (_error) {
-          // A missing composer must not turn a fork failure into a crashed slot;
-          // at least leave a diagnostic so the failure is not completely silent.
-          console.warn('side-chat: could not show the error notice', _error);
+          // A missing composer must not turn a failure into a crashed slot;
+          // at least leave a diagnostic so it is not completely silent.
+          console.warn('side-chat: could not show the notice', _error);
         }
+      }
+
+      function notifyError(sessionId, message) {
+        notify(sessionId, 'error', message);
       }
 
       function forkErrorMessage(error) {
@@ -257,25 +458,86 @@ window.__ModuleLoader__.load({
         return t('error.fork');
       }
 
-      async function openSideChat(parent, text, onError) {
-        let child;
-        try {
-          // Omitting `atSeq` forks from the latest completed-turn prefix.
-          child = await ctx.sessions.fork({ sessionId: parent, increaseTitle: true });
-        } catch (error) {
-          onError(forkErrorMessage(error));
+      /** One fork per parent at a time; `/side` has no component-local busy state. */
+      const inFlightParents = new Set();
+
+      /**
+       * Fork one child, stage its opening draft, open its tab, and remember it.
+       * `depth` is the depth of the conversation we are forking FROM.
+       * A failed tab open keeps the prompt inside the recent entry so a retry
+       * restores the selected context instead of opening an empty draft.
+       */
+      async function openSideChat(parent, text, onError, depth = 0) {
+        if (inFlightParents.has(parent)) return false;
+        if (depth >= MAX_DEPTH) {
+          onError(t('error.depth'));
           return false;
         }
-        const prompt = buildOpeningDraft(text, t);
-        pendingDrafts.set(child, prompt);
+        inFlightParents.add(parent);
         try {
-          ctx.sidebarRight.openResource(
-            encodeAddress({ child, parent, label: firstLine(text) }),
-            { kind: 'sidechat', preferNewPane: true },
-          );
-          return true;
+          let child;
+          try {
+            // Omitting `atSeq` forks from the latest completed-turn prefix.
+            child = await ctx.sessions.fork({ sessionId: parent, increaseTitle: true });
+          } catch (error) {
+            onError(forkErrorMessage(error));
+            return false;
+          }
+          const truncated = String(text ?? '').length > MAX_TEXT;
+          const prompt = buildOpeningDraft(capText(text), t, truncated);
+          const label = firstLine(text) || t('home.untitled');
+          const address = encodeAddress({ child, parent, label, depth: depth + 1 });
+          pendingDrafts.set(child, prompt);
+          const entry = {
+            child, parent, address, label, depth: depth + 1, createdAt: Date.now(),
+          };
+          try {
+            ctx.sidebarRight.openResource(address, { kind: 'sidechat', preferNewPane: true });
+            saveRecent(addRecent(loadRecent(), entry));
+            return true;
+          } catch (_error) {
+            pendingDrafts.delete(child);
+            // Retain the prompt so reopenSideChat can prefill on retry.
+            saveRecent(addRecent(loadRecent(), { ...entry, prompt }));
+            onError(t('error.open'));
+            return false;
+          }
+        } finally {
+          inFlightParents.delete(parent);
+        }
+      }
+
+      /** Reveal an existing side-chat tab; verify the child is still listed. */
+      function reopenSideChat(entry, onError) {
+        if (!isRecentEntry(entry) || parseAddress(entry.address) === undefined) {
+          onError(t('home.missing'));
+          return false;
+        }
+        try {
+          const row = ctx.sessions.list.getSnapshot().byId[entry.child];
+          if (row === undefined) {
+            saveRecent(removeRecent(loadRecent(), entry.child));
+            // Informational, not a failure: an archived child is not an error.
+            notify(entry.parent, 'info', t('home.missing'));
+            return false;
+          }
+          // Restore a failed open's context; consume it once on success.
+          if (typeof entry.prompt === 'string' && entry.prompt !== '') {
+            pendingDrafts.set(entry.child, entry.prompt);
+          }
+          try {
+            ctx.sidebarRight.openResource(entry.address, { kind: 'sidechat', preferNewPane: true });
+            if (entry.prompt !== undefined) {
+              const { prompt: _used, ...rest } = entry;
+              saveRecent(addRecent(loadRecent(), rest));
+            }
+            return true;
+          } catch (_error) {
+            if (typeof entry.prompt === 'string') pendingDrafts.delete(entry.child);
+            onError(t('error.open'));
+            return false;
+          }
         } catch (_error) {
-          pendingDrafts.delete(child);
           onError(t('error.open'));
           return false;
         }
@@ -309,11 +571,13 @@ window.__ModuleLoader__.load({
           // Disable both buttons while the fork RPC is in flight: a second
           // click would create another numbered child and another tab.
           setBusy(true);
-          void openSideChat(sessionId, capText(text), message => notifyError(sessionId, message))
+          void openSideChat(sessionId, text,
+            message => notifyError(sessionId, message), depthFor(loadRecent(), sessionId))
             .then(ok => {
               if (ok) { clearSelection(); dismiss(); }
               else setBusy(false);
-            });
+            })
+            .catch(() => { setBusy(false); });
         };
 
         return h(React.Fragment, null,
@@ -341,6 +605,44 @@ window.__ModuleLoader__.load({
         );
       }
 
+      /** v2: guide-page capsule and `/side` both lead here. */
+      function SideChatHome(props) {
+        const { sessionId } = props;
+        const [recent, setRecent] = React.useState(loadRecent());
+        const [busy, setBusy] = React.useState(false);
+        const items = sanitizeRecent(recent);
+        React.useEffect(() => { setRecent(loadRecent()); }, []);
+
+        const onNew = () => {
+          if (busy) return;
+          setBusy(true);
+          void openSideChat(sessionId, '',
+            message => notifyError(sessionId, message), depthFor(loadRecent(), sessionId))
+            .then(() => { setBusy(false); setRecent(loadRecent()); })
+            .catch(() => { setBusy(false); });
+        };
+
+        const onReopen = (entry) => {
+          const ok = reopenSideChat(entry, message => notifyError(sessionId, message));
+          if (!ok) setRecent(loadRecent());
+        };
+
+        return h('div', { 'data-side-chat-home': '' },
+          h('style', { 'data-side-chat-home-styles': '' }, HOME_CSS),
+          h('h2', null, t('home.title')),
+          h('p', null, t('home.intro')),
+          h('button', { type: 'button', disabled: busy, onClick: onNew },
+            busy ? t('action.busy') : t('home.new')),
+          h('h3', null, t('home.recent')),
+          items.length === 0
+            ? h('p', null, t('home.empty'))
+            : h('ul', { 'data-side-chat-list': '' },
+              ...items.map(item => h('li', { key: item.child },
+                h('button', { type: 'button', onClick: () => onReopen(item) },
+                  `${item.label} · ${t('home.open')}`)))),
+        );
+      }
+
       ctx.effect(() => {
         const dispose = ctx.slots.inject('conversation.chat.text-interaction', () => ctx.slots.register({
           name: 'conversation.chat.text-interaction',
@@ -349,6 +651,25 @@ window.__ModuleLoader__.load({
         }, SideChatActions));
         return typeof dispose === 'function' ? dispose : () => {};
       }, 'side-chat: text interaction actions');
+
+      // v2: /side command. `commandUi` is optional via ctx.inject so a profile
+      // without the commands package parks only this entry, not the plugin.
+      ctx.inject(['commandUi'], commandScope => {
+        commandScope.effect(() => commandScope.commandUi.register({
+          name: 'side',
+          label: () => t('command.label'),
+          description: () => t('command.description'),
+          available: session => writableSession(ctx.sessions.binding(session.sessionId)),
+          ui: {
+            kind: 'action',
+            run: session => {
+              void openSideChat(session.sessionId, '',
+                message => notifyError(session.sessionId, message),
+                depthFor(loadRecent(), session.sessionId));
+            },
+          },
+        }), 'side-chat: /side command');
+      });
 
       ctx.inject(['slots', 'resources', 'sidebarRightTabs', 'sidebarRight', 'sessions', 'conversation'], scope => {
         function FixedChatView(viewProps) {
@@ -420,6 +741,7 @@ window.__ModuleLoader__.load({
           },
         }), 'side-chat: resource provider');
 
+        // v1: resource-only kind. `canOpen` still gates every address.
         scope.effect(() => scope.sidebarRightTabs.register({
           id: PLUGIN_ID,
           kind: 'sidechat',
@@ -432,6 +754,22 @@ window.__ModuleLoader__.load({
           },
         }), 'side-chat: tab type');
 
+        // v2: separate page kind for the guide capsule and the home page.
+        // A resource-only type cannot be opened via openTab(kind), which is
+        // exactly what a guide capsule does.
+        scope.effect(() => scope.sidebarRightTabs.register({
+          id: HOME_ID,
+          kind: HOME_KIND,
+          priority: 'extension',
+          title: () => t('home.title'),
+          guide: [{
+            id: 'side-chat',
+            order: 10,
+            title: () => t('guide.title'),
+            description: () => t('guide.description'),
+          }],
+        }), 'side-chat: home tab type');
+
         scope.effect(() => {
           const dispose = scope.slots.inject('sidebar.right.pane.tab', () => scope.slots.register({
             name: 'sidebar.right.pane.tab',
@@ -440,6 +778,15 @@ window.__ModuleLoader__.load({
           }, SideChatTab));
           return typeof dispose === 'function' ? dispose : () => {};
         }, 'side-chat: tab body');
+
+        scope.effect(() => {
+          const dispose = scope.slots.inject('sidebar.right.pane.tab', () => scope.slots.register({
+            name: 'sidebar.right.pane.tab',
+            key: HOME_ID,
+            locale: NS,
+          }, SideChatHome));
+          return typeof dispose === 'function' ? dispose : () => {};
+        }, 'side-chat: home tab body');
 
         scope.effect(() => {
           const dispose = scope.slots.inject('sidechat.conversation', () => scope.slots.register({
@@ -462,6 +809,15 @@ window.__ModuleLoader__.load({
         buildOpeningDraft,
         admitInteraction,
         waitForAbort,
+        isRecentEntry,
+        sanitizeRecent,
+        addRecent,
+        removeRecent,
+        depthFor,
+        MAX_DEPTH,
+        RECENT_LIMIT,
+        HOME_KIND,
+        HOME_ID,
       },
     };
   },

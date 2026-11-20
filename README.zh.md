@@ -35,26 +35,44 @@ plugin_manager action=install_bundle target=<path-to-checkout>
 - 标签体复用共享 Conversation 装配（`conversation.content`，`variant: 'embedded'`）并固定 Chat View，外面用 `SessionProvider` 包住一个 `sessions.retain()` 引用。标签关闭或插件卸载时会 `release()` 该引用。
 - 草稿初始化发生在标签自己的引用持有期间，因此草稿不会因 Session scope 拆卸而丢失，重复打开同一地址时也不会重复预填。
 
-## 与 Codex 的差异（v1 范围）
+## v2 批次 A（当前版本）
 
-| Codex | 本插件 v1 |
+`client.js` 现在有四个入口，且关闭的标签可以重新并排打开：
+
+| 入口 | 行为 |
 | --- | --- |
-| 隐藏的 developer/system 边界提示 | 预填草稿里的**可见**说明 |
+| **在选区内右键** | 原来的双按钮浮层（引用 / 在侧边聊天中提问） |
+| **`/side`** | 斜杠命令，从当前会话分叉一个空白侧边聊天 |
+| **右栏引导页卡片** | 打开「侧边聊天」首页 |
+| **首页** | 说明用法、新建空白侧边聊天、列出**最近的侧边聊天** |
+
+- **最近的侧边聊天**存在浏览器 `localStorage`（`dsh.sidechat.recent`，最多 20 条）。关闭标签不会删除子会话；点列表项会用**同一个地址** `openResource`，揭示已有标签——不会重新 fork、不会重复预填。若子会话已不在会话列表，记录会被移除并给出本地化提示。
+- `/side` 与首页创建的是空白侧边聊天：草稿里是本地化的「无选段」说明加边界说明，没有空块引用。
+- **递归上限 3 层**（地址里带 `depth`；v1 地址按 depth 0 解析，旧标签仍可用）。从过深的侧边聊天再分叉会给出本地化错误，而不是创建孙级会话。
+- **超长选段有可见的截断说明**，位置在边界说明之后，不会污染块引用。
+- 打开标签失败时会把该子会话**连同尚未写入的草稿**一起记录，从首页重试会恢复原来的引用选段，而不是打开一个空白草稿；重试成功后草稿记录会被清除。
+- 批次 A **只改 Client 半部**：不动 Host、不新增 Config schema、不新增 Session 事件、不换行名，刷新页面即可生效。
+
+## 与 Codex 的差异
+
+| Codex | 本插件 |
+| --- | --- |
+| 隐藏的 developer/system 边界提示 | 预填草稿里的**可见**说明（隐藏边界属批次 B） |
 | 关闭即丢弃的临时线程 | 保留在会话列表里的**持久** Session |
 | 只显示边界之后的新回合 | 继承历史在子会话中可见 |
 | `chatgpt.addToThread` | 同一浮层的「引用到当前聊天」动作（加上内置拖选引用） |
-| `/side` 命令、侧栏选择器、agent 工具 | v1 不做 |
+| `/side` 命令、侧栏选择器、agent 工具 | `/side` + 引导卡片 + 首页（批次 A）；agent 工具属批次 B |
 
-v1 还**不做**：隐藏 system prompt 注入（需要 Host `agent/created` 监听 + `ctx.systemPrompt.section()` + Host service 和 agent tool，让一次操作有两个调用者）、关标签自动归档、子会话标题定制、更多语言、发布到 npm / 插件市场。
+仍**未实现**（见 [PLAN.v2.md](PLAN.v2.md)）：隐藏 system prompt 注入、Host service + agent tool、Config schema、成功提示开关、子会话标题定制、更多语言、关标签自动归档、只显示边界之后的新回合、发布到 npm / 插件市场。
 
-## 交互说明与 v1 已知限制
+## 交互说明与当前限制
 
-- **只有在选区范围内右键**才会出现自定义浮层；在选区外右键仍是浏览器原生菜单。插件认领手势时会调用 `preventDefault()` 抑制原生菜单，因此复制请用 Cmd/Ctrl+C 或拖选。拖选 `selection` 手势刻意仍归内置的「引用文本」——正因为要与之共存，v1 没有应用内提示、斜杠命令或右栏引导卡片；发现入口只有 `meta.description` 和本文档。
-- **`sessions.fork()` 进行中**两个按钮会禁用，第二个按钮显示「正在创建侧边聊天…」。失败时在主会话输入框显示本地化错误提示，不开空标签、保留选区；成功后浮层消失、标签打开（没有额外的成功 toast）。
-- **v1 无法把已关闭的标签重新以并排方式打开。** 子会话是普通 Session，可以在主视图打开；暂无「最近关闭的侧边聊天」入口。
-- **fork 成功但打开标签失败时**，已创建的子会话仍留在会话列表里（错误文案会说明）。标签体本身有本地化的加载 / 失败状态，不会一直停在「正在打开侧边聊天…」。
-- **选段截断到 8000 字符**（不会把代理对切成半个 emoji），预填草稿里没有可见的「已截断」标记。
-- **在侧边聊天里也可以右键**，因此可以再分叉出孙级侧边聊天；v1 不限制这种递归。
+- **只有在选区范围内右键**才会出现自定义浮层；在选区外右键仍是浏览器原生菜单。认领手势时调用 `preventDefault()` 抑制原生菜单，因此复制请用 Cmd/Ctrl+C 或拖选。拖选仍归内置的「引用文本」。
+- **`sessions.fork()` 进行中**两个按钮会禁用，第二个显示「正在创建侧边聊天…」。失败时在主会话输入框显示本地化错误、不开空标签、保留选区；成功后浮层消失、标签打开——**仍没有成功 toast**（`successNotice` Config 开关计划放在批次 B）。
+- 子会话是**普通持久 Session**；关闭标签不删除，现在可从「最近的侧边聊天」重新并排打开，但还没有自动归档。
+- 标签体有本地化的加载 / 失败状态，不会一直停在「正在打开侧边聊天…」。
+- **选段截断到 8000 字符**（不会把代理对切成半个 emoji），并有可见的截断说明。
+- 在侧边聊天里仍可右键，但受递归层数上限约束。
 - 草稿里的边界说明只写给模型看；「不会自动发送」的保证写在 `meta.description` 和文档里，而不是写进会被发送出去的草稿。
 
 ## 与 `dsh-select-ask` 的区别
@@ -71,4 +89,4 @@ v1 还**不做**：隐藏 system prompt 注入（需要 Host `agent/created` 监
 
 ## 文件
 
-`package.json`、`cordis.patch.yml`、`index.js`、`client.js`、`locale/en.json`、`locale/zh.json`、`icon.svg`、`README.md`、`README.zh.md`、`test/client.test.mjs`、`.gitignore`、`PLAN.md`。
+`package.json`、`cordis.patch.yml`、`index.js`、`client.js`、`locale/en.json`、`locale/zh.json`、`icon.svg`、`README.md`、`README.zh.md`、`test/client.test.mjs`、`.gitignore`、`PLAN.md`、`PLAN.v2.md`。

@@ -21,11 +21,17 @@ const fakeReact = {
 
 function loadPlugin() {
   let factory;
+  const storage = new Map();
+  const localStorage = {
+    getItem(key) { return storage.has(key) ? storage.get(key) : null; },
+    setItem(key, value) { storage.set(key, String(value)); },
+  };
   const sandbox = {
     window: {
       __ModuleLoader__: {
         load(registration) { factory = registration.factory; },
       },
+      localStorage,
     },
     URL,
     URLSearchParams,
@@ -34,7 +40,13 @@ function loadPlugin() {
     console,
   };
   runInNewContext(source, sandbox, { filename: 'client.js' });
-  return factory(specifier => (specifier === 'react' ? fakeReact : {}));
+  return {
+    face: factory(specifier => (specifier === 'react' ? fakeReact : {})),
+    resetStorage: () => { storage.clear(); },
+    seedRecent: entries => {
+      storage.set('dsh.sidechat.recent', JSON.stringify(entries));
+    },
+  };
 }
 
 function writableBinding() {
@@ -47,6 +59,7 @@ function createFakeCtx() {
     interactions: [],
     resources: [],
     tabs: [],
+    commands: [],
     slotRegistrations: [],
     opened: [],
     notices: [],
@@ -55,6 +68,7 @@ function createFakeCtx() {
     dismissed: 0,
     cleared: 0,
     bindings: { 'parent-1': writableBinding() },
+    sessionRows: { 'child-1': {} },
   };
   const dispose = () => {};
   const t = key => `t:${key}`;
@@ -77,9 +91,13 @@ function createFakeCtx() {
         release() { captured.released += 1; },
       }),
       using: async () => undefined,
+      list: { getSnapshot: () => ({ byId: captured.sessionRows }) },
     },
     sidebarRight: {
       openResource(address, options) { captured.opened.push({ address, options }); },
+    },
+    commandUi: {
+      register(contribution) { captured.commands.push(contribution); return dispose; },
     },
     slots: {
       inject(name, factory) {
@@ -128,7 +146,21 @@ function findActions(captured) {
 }
 
 function findTab(captured) {
-  return captured.slotRegistrations.find(entry => entry.name === 'sidebar.right.pane.tab');
+  return captured.slotRegistrations.find(entry => entry.name === 'sidebar.right.pane.tab'
+    && entry.options.key === '@local/dsh-side-chat');
+}
+
+function findHomeTab(captured) {
+  return captured.slotRegistrations.find(entry => entry.name === 'sidebar.right.pane.tab'
+    && entry.options.key === '@local/dsh-side-chat/home');
+}
+
+function resourceTab(captured) {
+  return captured.tabs.find(definition => definition.id === '@local/dsh-side-chat');
+}
+
+function homeTab(captured) {
+  return captured.tabs.find(definition => definition.id === '@local/dsh-side-chat/home');
 }
 
 function actionProps(captured, overrides = {}) {
@@ -149,7 +181,8 @@ async function settle() {
   await new Promise(resolve => setTimeout(resolve, 0));
 }
 
-const face = loadPlugin();
+const plugin = loadPlugin();
+const face = plugin.face;
 const helpers = face.helpers;
 
 /** Values created inside `vm` have foreign prototypes; normalize before deepEqual. */
@@ -167,9 +200,12 @@ test('plugin face exports inject, apply and the pure helpers', () => {
   for (const key of [
     'encodeAddress', 'parseAddress', 'capText', 'quoteBlock', 'firstLine',
     'buildOpeningDraft', 'admitInteraction', 'waitForAbort',
+    'isRecentEntry', 'sanitizeRecent', 'addRecent', 'removeRecent', 'depthFor',
   ]) {
     assert.equal(typeof helpers[key], 'function', `${key} must be exported`);
   }
+  assert.equal(helpers.MAX_DEPTH, 3);
+  assert.equal(helpers.RECENT_LIMIT, 20);
 });
 
 test('encodeAddress/parseAddress round-trip and canonical form', () => {
@@ -178,11 +214,27 @@ test('encodeAddress/parseAddress round-trip and canonical form', () => {
   });
   assert.ok(address.startsWith('dsh-resource://sidechat/session/'));
   assert.deepEqual(plain(helpers.parseAddress(address)), {
-    child: 'child/with space', parent: 'parent-1', label: 'First line',
+    child: 'child/with space', parent: 'parent-1', label: 'First line', depth: 0,
   });
   assert.deepEqual(plain(helpers.parseAddress('dsh-resource://SIDECHAT/session/c?parent=p')), {
-    child: 'c', parent: 'p', label: '',
+    child: 'c', parent: 'p', label: '', depth: 0,
   });
+});
+
+test('v2 depth round-trips and v1 addresses stay backwards compatible', () => {
+  const withDepth = helpers.encodeAddress({ child: 'c', parent: 'p', label: 'Q', depth: 2 });
+  assert.ok(withDepth.includes('depth=2'));
+  assert.deepEqual(plain(helpers.parseAddress(withDepth)), {
+    child: 'c', parent: 'p', label: 'Q', depth: 2,
+  });
+  // depth=0 is omitted so v1 addresses are byte-for-byte unchanged.
+  assert.equal(helpers.encodeAddress({ child: 'c', parent: 'p', depth: 0 }),
+    'dsh-resource://sidechat/session/c?parent=p');
+  // Invalid depths fall back to 0 instead of poisoning the entry.
+  for (const bad of ['-1', 'abc', '99999999999999999999']) {
+    assert.equal(helpers.parseAddress(
+      `dsh-resource://sidechat/session/c?parent=p&depth=${bad}`).depth, 0);
+  }
 });
 
 test('parseAddress rejects foreign, malformed and incomplete addresses', () => {
@@ -319,8 +371,8 @@ test('apply registers the side-chat interaction with the message-quotes gate', (
 test('apply registers a sidechat tab type with a parsed title', () => {
   const { ctx, captured, t } = createFakeCtx();
   face.apply(ctx);
-  assert.equal(captured.tabs.length, 1);
-  const tab = captured.tabs[0];
+  assert.equal(captured.tabs.length, 2, 'resource type + home page type');
+  const tab = resourceTab(captured);
   assert.equal(tab.id, '@local/dsh-side-chat');
   assert.equal(tab.kind, 'sidechat');
   assert.equal(tab.priority, 'extension');
@@ -479,4 +531,205 @@ test('tab body shows localized loading, failure and live Chat states', () => {
   assert.equal(live.children[0].type, baseProps.SessionProvider);
   assert.equal(live.children[0].props.session, reference);
   assert.equal(live.children[0].children[0], 'CHAT');
+});
+
+// ---------------------------------------------------------------------------
+// v2 batch A: recent side chats, depth, /side command, guide + home page
+// ---------------------------------------------------------------------------
+
+function recentEntry(child, depth = 1, createdAt = 1) {
+  return {
+    child,
+    parent: 'parent-1',
+    address: helpers.encodeAddress({ child, parent: 'parent-1', depth }),
+    label: `Q ${child}`,
+    depth,
+    createdAt,
+  };
+}
+
+test('addRecent de-duplicates, orders newest first and enforces the cap', () => {
+  const first = helpers.addRecent([], recentEntry('a', 1, 1));
+  assert.equal(first.length, 1);
+  const second = helpers.addRecent(first, recentEntry('b', 1, 2));
+  assert.equal(second[0].child, 'b');
+  const deduped = helpers.addRecent(second, recentEntry('a', 1, 3));
+  assert.equal(deduped.length, 2);
+  assert.equal(deduped[0].child, 'a', 're-adding a child moves it to the front');
+  let many = [];
+  for (let i = 0; i < 25; i += 1) many = helpers.addRecent(many, recentEntry(`c${i}`, 1, i));
+  assert.equal(many.length, helpers.RECENT_LIMIT);
+  assert.deepEqual(plain(helpers.addRecent([{ junk: true }], { junk: true })), []);
+});
+
+test('depthFor returns the conversation depth (no off-by-one)', () => {
+  const list = [recentEntry('a', 1, 1), recentEntry('b', 2, 2)];
+  assert.equal(helpers.depthFor(list, 'a'), 1);
+  assert.equal(helpers.depthFor(list, 'b'), 2);
+  assert.equal(helpers.depthFor(list, 'parent-1'), 0);
+  assert.equal(helpers.removeRecent(list, 'a').length, 1);
+  // A three-level chain must reach depth 3, not be cut off at 2.
+  const chain = [recentEntry('a', 1, 1), recentEntry('b', 2, 2), recentEntry('c', 3, 3)];
+  assert.equal(helpers.depthFor(chain, 'c'), 3);
+});
+
+test('isRecentEntry rejects an address that points at another child', () => {
+  const entry = recentEntry('child-1', 1, 1);
+  assert.equal(helpers.isRecentEntry(entry), true);
+  assert.equal(helpers.isRecentEntry({ ...entry, address: helpers.encodeAddress({ child: 'other', parent: 'parent-1' }) }), false);
+  assert.equal(helpers.isRecentEntry({ ...entry, address: 'not-a-url' }), false);
+  assert.equal(helpers.isRecentEntry({ ...entry, prompt: '> quoted\n\nnotes' }), true);
+  assert.equal(helpers.isRecentEntry({ ...entry, prompt: 42 }), false);
+});
+
+test('buildOpeningDraft handles no selection and truncation without polluting the quote', () => {
+  const t = key => `T(${key})`;
+  assert.equal(helpers.buildOpeningDraft('', t), 'T(draft.noSelection)\n\nT(draft.boundary)');
+  const truncated = helpers.buildOpeningDraft('alpha', t, true);
+  assert.equal(truncated, '> alpha\n\nT(draft.boundary)\n\nT(draft.truncated)');
+  assert.ok(truncated.indexOf('T(draft.truncated)') > truncated.indexOf('T(draft.boundary)'),
+    'the truncation note goes after the boundary, never inside the blockquote');
+  // v1 call shape is unchanged.
+  assert.equal(helpers.buildOpeningDraft('alpha\nbeta', t), '> alpha\n> beta\n\nT(draft.boundary)');
+});
+
+test('apply registers the /side command with a writable-session gate', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  assert.equal(captured.commands.length, 1);
+  const command = captured.commands[0];
+  assert.equal(command.name, 'side');
+  assert.equal(command.ui.kind, 'action');
+  assert.equal(command.label(), 't:command.label');
+  assert.equal(command.available({ sessionId: 'parent-1' }), true);
+  assert.equal(command.available({ sessionId: 'missing' }), false);
+
+  command.ui.run({ sessionId: 'parent-1' });
+  await settle();
+  assert.equal(captured.opened.length, 1, '/side forks a blank side chat');
+  const parsed = helpers.parseAddress(captured.opened[0].address);
+  assert.equal(parsed.label, 't:home.untitled');
+  assert.equal(parsed.depth, 1);
+});
+
+test('apply registers a separate home page type with a unique guide capsule', () => {
+  const { ctx, captured, t } = createFakeCtx();
+  face.apply(ctx);
+  const home = homeTab(captured);
+  assert.equal(home.kind, helpers.HOME_KIND);
+  assert.equal(home.patterns, undefined, 'a page type must omit patterns');
+  assert.equal(home.title('sidebar://sidechat-home'), t('home.title'));
+  assert.equal(home.guide.length, 1);
+  assert.equal(home.guide[0].id, 'side-chat');
+  assert.equal(home.guide[0].title(), t('guide.title'));
+  assert.ok(findHomeTab(captured), 'home tab body is registered under HOME_ID');
+});
+
+test('home page renders an empty state and can create a blank side chat', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const tree = findHomeTab(captured).component({ sessionId: 'parent-1' });
+  assert.equal(tree.children[1].children[0], 't:home.title');
+  assert.equal(tree.children[5].children[0], 't:home.empty');
+  tree.children[3].props.onClick();
+  await settle();
+  assert.equal(captured.opened.length, 1);
+});
+
+test('home page lists recent side chats and reopens an existing child', () => {
+  plugin.resetStorage();
+  plugin.seedRecent([recentEntry('child-1', 1, 1)]);
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const tree = findHomeTab(captured).component({ sessionId: 'parent-1' });
+  assert.equal(tree.children[5].type, 'ul');
+  const rowButton = tree.children[5].children[0].children[0];
+  assert.ok(rowButton.children[0].includes('t:home.open'));
+  rowButton.props.onClick();
+  assert.equal(captured.opened.length, 1, 'reopening reveals the existing tab');
+  assert.equal(captured.opened[0].address, recentEntry('child-1', 1, 1).address);
+});
+
+test('reopening a child that is no longer listed removes the entry with a notice', () => {
+  plugin.resetStorage();
+  plugin.seedRecent([recentEntry('gone', 1, 1)]);
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const tree = findHomeTab(captured).component({ sessionId: 'parent-1' });
+  tree.children[5].children[0].children[0].props.onClick();
+  assert.equal(captured.opened.length, 0, 'no tab for a missing child');
+  assert.equal(captured.notices[0].level, 'info', 'an archived child is informational, not an error');
+  assert.equal(captured.notices[0].text, 't:home.missing');
+});
+
+test('recursion depth limit blocks a fork from a too-deep side chat', async () => {
+  plugin.resetStorage();
+  // parent-1 is itself recorded as a depth-3 child -> forking from it is refused.
+  plugin.seedRecent([recentEntry('parent-1', helpers.MAX_DEPTH, 1)]);
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  captured.commands[0].ui.run({ sessionId: 'parent-1' });
+  await settle();
+  assert.equal(captured.opened.length, 0, 'no fork beyond MAX_DEPTH');
+  assert.equal(captured.notices[0].text, 't:error.depth');
+});
+
+test('a failed tab open still records the child so the home page can retry', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  ctx.sidebarRight.openResource = () => { throw new Error('placement failed'); };
+  captured.commands[0].ui.run({ sessionId: 'parent-1' });
+  await settle();
+  assert.equal(captured.notices[0].text, 't:error.open');
+  const tree = findHomeTab(captured).component({ sessionId: 'parent-1' });
+  assert.equal(tree.children[5].type, 'ul', 'the failed child is still listed for retry');
+});
+
+test('a retry restores the selected context instead of opening an empty draft', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  ctx.sidebarRight.openResource = () => { throw new Error('placement failed'); };
+  const actions = findActions(captured);
+  actions.component(actionProps(captured)).children[1].children[1].props.onClick();
+  await settle();
+  assert.equal(captured.draftInits.length, 0, 'the tab never opened, so no draft was applied');
+
+  // Recover placement, then click the recent entry from the home page.
+  ctx.sidebarRight.openResource = (address, options) => { captured.opened.push({ address, options }); };
+  const tree = findHomeTab(captured).component({ sessionId: 'parent-1' });
+  tree.children[5].children[0].children[0].props.onClick();
+  assert.equal(captured.opened.length, 1, 'retry opens the same address');
+
+  const provider = captured.resources[0];
+  const iterator = provider.open(captured.opened[0].address, { signal: new AbortController().signal });
+  await iterator.next();
+  assert.equal(captured.draftInits.length, 1, 'the staged prompt is restored');
+  assert.equal(captured.draftInits[0].options.prompt, '> selected text\n\nt:draft.boundary');
+  await iterator.return();
+});
+
+test('depth is not double-counted across a second-level fork', async () => {
+  plugin.resetStorage();
+  plugin.seedRecent([recentEntry('parent-1', 1, 1)]);
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  captured.commands[0].ui.run({ sessionId: 'parent-1' });
+  await settle();
+  assert.equal(captured.opened.length, 1);
+  assert.equal(helpers.parseAddress(captured.opened[0].address).depth, 2);
+});
+
+test('/side is guarded against concurrent forks', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  ctx.sessions.fork = () => new Promise(resolve => { setTimeout(() => resolve('child-1'), 10); });
+  face.apply(ctx);
+  captured.commands[0].ui.run({ sessionId: 'parent-1' });
+  captured.commands[0].ui.run({ sessionId: 'parent-1' });
+  await new Promise(resolve => { setTimeout(resolve, 40); });
+  assert.equal(captured.opened.length, 1, 'only one fork/tab from two rapid /side invocations');
 });
