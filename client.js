@@ -492,7 +492,11 @@ window.__ModuleLoader__.load({
             onError(t('error.fork'));
             return false;
           }
-          const commandResult = response.ok === true ? response.value : undefined;
+          // RemoteResult<{ result: CommandResult }>: the command outcome is
+          // nested under `value.result`, not `value` itself.
+          const commandResult = response.ok === true && response.value !== undefined
+            ? response.value.result
+            : undefined;
           if (commandResult === undefined || commandResult.kind !== 'success') {
             const failure = parseCommandPayload(commandResult === undefined ? '' : commandResult.text);
             onError(failure.code === 'session/migration-required'
