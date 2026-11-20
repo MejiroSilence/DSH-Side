@@ -26,6 +26,8 @@ window.__ModuleLoader__.load({
     const ADDRESS_PREFIX = 'dsh-resource://sidechat/session/';
     const ADDRESS_PATTERN = 'dsh-resource://sidechat/**';
     const MAX_TEXT = 8000;
+    /** Must match `SIDE_CHAT_PREFIX` in index.js. Durable title marker. */
+    const SIDE_CHAT_PREFIX = 'Side chat: ';
     // v2: the resource-only `sidechat` kind cannot be opened as a page, so the
     // guide capsule and `/side` lead to a separate page kind.
     const HOME_KIND = 'sidechat-home';
@@ -472,12 +474,12 @@ window.__ModuleLoader__.load({
 
       /**
        * Create a side chat with the proven Client `sessions.fork()` path.
-       * The draft contains only the quote (plus no-selection / truncation
-       * notes); the developer boundary is delivered by the Host as a hidden
-       * system-prompt section, recognised from the fork's durable header.
-       * No Client->Host RPC is involved. `depth` is the depth of the
-       * conversation we are forking FROM. A failed tab open keeps the prompt
-       * in the recent entry so a retry restores it.
+       * The child is marked with a durable `Side chat: ` title prefix so the
+       * Host installs its hidden boundary section ONLY for our own children —
+       * an ordinary user fork is untouched. If marking fails, fall back to the
+       * visible note in the draft so the boundary is never silently lost.
+       * `depth` is the depth of the conversation we are forking FROM. A failed
+       * tab open keeps the prompt in the recent entry so a retry restores it.
        */
       async function openSideChat(parent, text, onError, depth = 0) {
         if (inFlightParents.has(parent)) return false;
@@ -495,8 +497,19 @@ window.__ModuleLoader__.load({
             return false;
           }
           const truncated = String(text ?? '').length > MAX_TEXT;
-          const prompt = buildQuoteDraft(text, t, truncated);
           const label = firstLine(text) || t('home.untitled');
+          let marked = true;
+          try {
+            const rename = await ctx.sessions.using(child, { source: 'sideChat' },
+              reference => reference.binding.session.rename(`${SIDE_CHAT_PREFIX}${label}`));
+            if (rename !== undefined && rename.ok === false) marked = false;
+          } catch (error) {
+            console.warn('side-chat: could not mark the child Session', error);
+            marked = false;
+          }
+          const prompt = marked
+            ? buildQuoteDraft(text, t, truncated)
+            : buildOpeningDraft(capText(text), t, truncated);
           const address = encodeAddress({ child, parent, label, depth: depth + 1 });
           pendingDrafts.set(child, prompt);
           const entry = {

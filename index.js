@@ -24,9 +24,10 @@ const requireFromDsh = createRequire(`${dshRoot}/package.json`)
 const z = requireFromDsh('@deepseek-ai/schemastery')
 const { defineTool } = requireFromDsh('@deepseek-ai/dsh-tools')
 
-// Applies to forked Sessions (the durable `header.isSeeded` marker), which is
-// how the Host recognises a side chat without any Client->Host RPC. Wording is
-// deliberately neutral so an ordinary user fork is not disrupted either.
+// Installed only for Sessions this plugin marked with `SIDE_CHAT_PREFIX` in
+// their durable title. An ordinary user fork never receives this section. The
+// title marker is read through the existing 'title' projection, so no new
+// Session event type and no Client->Host RPC are needed.
 const DEFAULT_BOUNDARY = 'This Session was forked from a parent conversation. '
   + 'Inherited history is reference context only. Answer the user\'s current request here; '
   + 'do not assume the parent task continues, do not change files, '
@@ -42,7 +43,7 @@ export const Config = z.object({
   boundaryText: z.string().default(DEFAULT_BOUNDARY),
 })
 
-export const inject = ['sessionController', 'commands', 'tools', 'systemPrompt', 'agents', 'sessions']
+export const inject = ['sessionController', 'commands', 'tools', 'systemPrompt', 'agents', 'sessions', 'sessionProjections']
 
 export const name = 'side-chat'
 
@@ -52,6 +53,8 @@ const TRUNCATED = '(The selection was too long and was capped at 8000 characters
 const UNTITLED = 'Blank side chat'
 const SECTION_NAME = 'side-chat:boundary'
 const COMMAND_NAME = 'side-chat-fork'
+/** Client marks its forked children with this durable title prefix. */
+export const SIDE_CHAT_PREFIX = 'Side chat: '
 
 // ---------------------------------------------------------------------------
 // Pure helpers (also exported for tests; intentionally small — the Client half
@@ -84,12 +87,20 @@ export const helpers = {
     const truncation = String(text ?? '').length > MAX_TEXT ? `\n\n${TRUNCATED}` : ''
     return `${quote}${truncation}`
   },
-  /** True for a forked (side-chat) Session, excluding subagent children. */
+  /**
+   * True only for a Session this plugin created: a fork whose durable title
+   * carries `SIDE_CHAT_PREFIX`. An ordinary user fork (title "Parent (2)") is
+   * NOT matched, so it never receives the hidden boundary.
+   */
   isSideChatSession(ctx, sessionId) {
     if (!sessionId) return false
     const session = ctx.sessions.get(sessionId)
-    if (session === undefined) return false
-    return session.header.isSeeded === true && session.header.origin !== 'subagent'
+    if (session === undefined || session.header.isSeeded !== true
+      || session.header.origin === 'subagent') return false
+    const projections = ctx.sessionProjections
+    if (projections === undefined) return false
+    const title = projections.stateOf(session, 'title')
+    return typeof title === 'string' && title.startsWith(SIDE_CHAT_PREFIX)
   },
 }
 

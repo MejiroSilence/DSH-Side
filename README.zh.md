@@ -63,13 +63,13 @@ Host 半部现在把 developer 边界作为**隐藏**的 system prompt section �
 | Host（`index.js`） | `agent/created` 时安装 `ctx.systemPrompt.section()`，其 `text()` 只对 fork 出来的 Session 返回边界文案 |
 | Agent 工具 | `side_chat_create` 仍调用 Host 的 `createSideChat()` |
 
-- **Host 如何认出侧边聊天**：fork 会在 Session 上留下持久化的 `header.isSeeded` 标记。section 的 `text()` 在组装 prompt 时读 `ctx.sessions.get(id).header`，并跳过 subagent（`origin === 'subagent'`）。因为标记是持久化的，**DSH 重启后隐藏边界依然存在**——没有进程内缓存，也不新增 Session 事件类型。
+- **Host 如何认出侧边聊天**：Client 给每个子会话用 `session.rename` 设一个持久化的 `Side chat: ` 标题前缀（用的是已有的 `session/title` 事件）。section 的 `text()` 在组装 prompt 时同时检查：该会话是 fork（`header.isSeeded`）、不是 subagent、且 `title` 投影以该前缀开头。**用户手动 fork 出来的普通会话**（标题形如 `Parent (2)`）不匹配，因此完全不会收到边界。标记存在 session log 里，**DSH 重启后依然有效**——没有进程内缓存、不新增事件类型、不需要 Client→Host 远程调用。
 - 注册是双 owner（`agent.ctx` fiber + 插件自己的 effect），并有 `agent/disposed` 清理。
 - **Config**（`cordis.patch.yml` 行的 `config`）：`hiddenBoundary`（默认 `true`）、`successNotice`（默认 `false`）、`boundaryText`（覆盖 developer 文案）。关掉 `hiddenBoundary` 会完全移除隐藏 section，草稿里也不会出现边界说明。
 - **行改名为 `side-chat-v2`**，以让 Host 模块重新加载（Host 模块按行 specifier 缓存）。`list_plugins` 显示 `include:side-chat-v2`；Client 模块 id、资源协议、tab kind、interaction id、地址格式都不变。
 - **改 Host 代码**需要 `remove_bundle @local/dsh-side-chat` → `install_bundle <path-to-checkout>`，或重启 DSH。只改 Client 需要让 DSH 窗口重新加载——可靠做法是 `Cmd+Q` 完全退出再重开（HMR 只重拉模块脚本，不会重跑 `apply`）。
 
-**作用范围**：边界会应用到所有非 subagent 的 fork 会话，包括用户手动 fork 出来的普通会话。文案是中性的（「继承历史仅作参考，请回答当前请求」），不会干扰普通 fork。
+**可见变化**：子会话在会话列表里的标题变成 `Side chat: <选段首行>`，不再是默认的 `Parent (2)`。若这次改名失败，草稿会回退成可见的边界说明，保证指令不会悄悄丢失。
 
 **已知限制**：`maxDepth` / `recentLimit` 仍是 Client 常量（批次 C）。`side-chat-fork` session command 仍保留注册以兼容，但 Web UI 已不再使用它——session command 会往来源 Session 的日志写 `command/run` / `command/done`。
 

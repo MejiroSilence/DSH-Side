@@ -65,12 +65,14 @@ note. Creating a side chat involves **no Client→Host RPC**.
 | Host (`index.js`) | On `agent/created`, installs a `ctx.systemPrompt.section()` whose `text()` returns the boundary only for forked Sessions |
 | Agent tool | `side_chat_create` still calls the Host `createSideChat()` operation |
 
-- **How the Host recognises a side chat**: a fork sets a durable
-  `header.isSeeded` marker on the Session. The section's `text()` reads
-  `ctx.sessions.get(id).header` at prompt-assembly time and skips subagent
-  children (`origin === 'subagent'`). Because the marker is persisted, the
-  boundary **survives a DSH restart** — there is no in-process cache and no new
-  Session event type.
+- **How the Host recognises a side chat**: the Client renames each child with a
+  durable `Side chat: ` title prefix (an existing `session/title` event). At
+  prompt-assembly time the section's `text()` checks that the Session is a fork
+  (`header.isSeeded`), is not a subagent, and that the `title` projection starts
+  with that prefix. An ordinary user fork (title `Parent (2)`) does **not**
+  match, so it receives no boundary. Everything is persisted in the session log,
+  so the boundary **survives a DSH restart** — no in-process cache, no new event
+  type, no Client→Host RPC.
 - Registrations are double-owned (`agent.ctx` fiber + the plugin's own effect),
   with `agent/disposed` cleanup.
 - **Config** (`cordis.patch.yml` row `config`): `hiddenBoundary` (default `true`),
@@ -86,10 +88,9 @@ note. Creating a side chat involves **no Client→Host RPC**.
   edits need the DSH window reloaded — a full `Cmd+Q` quit and reopen is the
   reliable way (HMR only re-pulls the module script, it does not re-run `apply`).
 
-**Scope note**: the boundary is applied to every forked Session that is not a
-subagent, including an ordinary user-initiated fork. The wording is neutral
-("inherited history is reference context; answer the current request here"), so
-it does not disrupt a normal fork.
+**Visible change**: the child Session's list title is now `Side chat: <first line>`
+instead of the default `Parent (2)`. If that rename fails, the draft falls back
+to the visible boundary note so the instruction is never silently lost.
 
 **Known limits**: `maxDepth` / `recentLimit` are still Client constants (batch C).
 The `side-chat-fork` session command remains registered for compatibility but is

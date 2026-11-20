@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "侧边聊天",
-    "description": "在聊天里右键选中文本会出现两个动作：「引用到当前聊天」把 Markdown 块引用插入当前输入框但不发送；「在侧边聊天中提问」用 session.fork 分叉出真实的子 Session，并在右侧栏以 Chat 标签并排打开。子 Session 会留在会话列表里，并继承主会话历史作为参考上下文。选段会以块引用预填进子会话草稿；developer 边界说明改为 fork 会话上的隐藏 system prompt section，不会自动发送：只有按 Enter 才会产生模型请求（可能包含工具调用）。关闭标签不会删除子 Session；禁用插件后所有入口都会消失。与 Codex 的差异：子会话是普通持久 Session，且边界会应用到所有非 subagent 的 fork 会话。v2 批次 A 增加了 /side 斜杠命令、右栏引导卡片与首页、可重新并排打开已关闭标签的「最近的侧边聊天」列表、嵌套层数上限和截断说明。批次 B 把 developer 边界移入 Host 半部作为隐藏 section（重启后仍有效），新增 Config schema，并把 Host 行改名为 side-chat-v2。改 Host 代码需要 remove_bundle + install_bundle（或重启 DSH）；只改 Client 需要让 DSH 窗口重新加载。针对 DSH 0.2.2-rc.5 开发。"
+    "description": "在聊天里右键选中文本会出现两个动作：「引用到当前聊天」把 Markdown 块引用插入当前输入框但不发送；「在侧边聊天中提问」用 session.fork 分叉出真实的子 Session，并在右侧栏以 Chat 标签并排打开。子 Session 会留在会话列表里，并继承主会话历史作为参考上下文。选段会以块引用预填进子会话草稿；developer 边界说明改为 fork 会话上的隐藏 system prompt section，不会自动发送：只有按 Enter 才会产生模型请求（可能包含工具调用）。关闭标签不会删除子 Session；禁用插件后所有入口都会消失。与 Codex 的差异：子会话是普通持久 Session，且隐藏边界只应用到本插件标记的会话（不会影响用户手动 fork 的普通会话）。v2 批次 A 增加了 /side 斜杠命令、右栏引导卡片与首页、可重新并排打开已关闭标签的「最近的侧边聊天」列表、嵌套层数上限和截断说明。批次 B 把 developer 边界移入 Host 半部作为隐藏 section（重启后仍有效），新增 Config schema，并把 Host 行改名为 side-chat-v2。改 Host 代码需要 remove_bundle + install_bundle（或重启 DSH）；只改 Client 需要让 DSH 窗口重新加载。针对 DSH 0.2.2-rc.5 开发。"
   }
 }

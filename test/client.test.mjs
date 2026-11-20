@@ -62,6 +62,7 @@ function createFakeCtx() {
     commands: [],
     executed: [],
     refreshed: 0,
+    renames: [],
     slotRegistrations: [],
     opened: [],
     notices: [],
@@ -92,7 +93,9 @@ function createFakeCtx() {
         binding: { sessionId: 'child-1', ctx: {} },
         release() { captured.released += 1; },
       }),
-      using: async () => undefined,
+      using: async (_id, _options, operation) => operation({
+        binding: { session: { rename: async title => { captured.renames.push(title); return { ok: true }; } } },
+      }),
       refresh: async () => { captured.refreshed += 1; },
       list: { getSnapshot: () => ({ byId: captured.sessionRows }) },
     },
@@ -786,7 +789,7 @@ test('buildQuoteDraft contains only the quote, never the visible boundary', () =
   assert.ok(!truncated.includes('T(draft.boundary)'), 'no boundary text in the draft');
 });
 
-test('openSideChat forks locally and never calls a Host command', async () => {
+test('openSideChat forks locally, marks the child title and never calls a Host command', async () => {
   plugin.resetStorage();
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
@@ -796,6 +799,25 @@ test('openSideChat forks locally and never calls a Host command', async () => {
   assert.equal(captured.executed.length, 0, 'no Host command invocation');
   assert.equal(captured.opened.length, 1);
   assert.equal(captured.notices.length, 0, 'no fallback or error notice');
+  assert.equal(captured.renames.length, 1, 'the child is marked with a durable title');
+  assert.equal(captured.renames[0], 'Side chat: selected text');
+});
+
+test('a failed title mark falls back to the visible boundary note', async () => {
+  plugin.resetStorage();
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  ctx.sessions.using = async () => ({ ok: false });
+  const actions = findActions(captured);
+  actions.component(actionProps(captured)).children[1].children[1].props.onClick();
+  await settle();
+  assert.equal(captured.opened.length, 1, 'the side chat is still created');
+  const provider = captured.resources[0];
+  const iterator = provider.open(captured.opened[0].address, { signal: new AbortController().signal });
+  await iterator.next();
+  assert.ok(captured.draftInits[0].options.prompt.includes('t:draft.boundary'),
+    'boundary is not silently lost when marking fails');
+  await iterator.return();
 });
 
 test('the staged draft holds only the quote (boundary is a hidden Host section)', async () => {

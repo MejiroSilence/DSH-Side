@@ -18,7 +18,7 @@ const { defineTool } = requireFromDsh('@deepseek-ai/dsh-tools');
 
 let source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 source = source.replace(/^import .*$/gmu, '').replace(/^export /gmu, '');
-source += '\nmodule.exports = { Config, helpers, apply, inject, name };\n';
+source += '\nmodule.exports = { Config, helpers, apply, inject, name, SIDE_CHAT_PREFIX };\n';
 
 const disposer = () => {};
 
@@ -62,17 +62,27 @@ const DEFAULT_HEADERS = {
   'child-1': { isSeeded: true },
 };
 
+const DEFAULT_TITLES = {
+  'session-1': 'Main chat',
+  'child-1': 'Side chat: alpha',
+};
+
 function makeCtx(options = {}) {
   agentState = { sections: [], disposed: 0 };
   const registered = { commands: [], tools: [], events: [], effects: [] };
   const agent = makeAgent(options.sessionId ?? 'session-1');
   const headers = options.headers ?? DEFAULT_HEADERS;
+  const titles = options.titles ?? DEFAULT_TITLES;
   const ctx = {
     sessionController: {
       fork: options.fork ?? (async () => ({ sessionId: 'child-1' })),
     },
     sessions: {
-      get: id => (headers[id] === undefined ? undefined : { header: headers[id] }),
+      get: id => (headers[id] === undefined
+        ? undefined : { header: { ...headers[id], id } }),
+    },
+    sessionProjections: {
+      stateOf: (session, key) => (key === 'title' ? titles[session.header.id] ?? null : undefined),
     },
     commands: { register: definition => { registered.commands.push(definition); return disposer; } },
     tools: { register: definition => { registered.tools.push(definition); return disposer; } },
@@ -102,6 +112,8 @@ test('Host exports a callable Config with the documented defaults', () => {
   assert.ok(host.inject.includes('systemPrompt'));
   assert.ok(host.inject.includes('agents'));
   assert.ok(host.inject.includes('sessions'));
+  assert.ok(host.inject.includes('sessionProjections'));
+  assert.equal(host.SIDE_CHAT_PREFIX, 'Side chat: ');
 });
 
 test('apply registers one command, one tool, one scoped section and both agent events', () => {
@@ -133,14 +145,25 @@ test('createSideChat forks once and keeps the boundary out of the draft', async 
   assert.equal(service.boundaryFor('session-1'), undefined, 'the parent is not a fork');
 });
 
-test('the hidden section is installed only for forked, non-subagent Sessions', () => {
-  const { ctx } = makeCtx({ headers: { 's-fork': { isSeeded: true }, 's-main': { isSeeded: false }, 's-sub': { isSeeded: true, origin: 'subagent' } } });
+test('the hidden section targets ONLY Sessions marked with the side-chat title', () => {
+  const { ctx } = makeCtx({
+    headers: {
+      's-side': { isSeeded: true },
+      's-plain-fork': { isSeeded: true },
+      's-main': { isSeeded: false },
+      's-sub': { isSeeded: true, origin: 'subagent' },
+    },
+    titles: {
+      's-side': 'Side chat: a question',
+      's-plain-fork': 'Parent (2)',
+      's-main': 'Main chat',
+      's-sub': 'Side chat: sub',
+    },
+  });
   host.apply(ctx, host.Config({}));
-  const text = agentState.sections[0].text;
-  assert.ok(typeof text === 'function');
-  // Rebind the agent's sessionId through the closure is not possible; instead
-  // verify the pure predicate directly.
-  assert.equal(host.helpers.isSideChatSession(ctx, 's-fork'), true);
+  assert.equal(host.helpers.isSideChatSession(ctx, 's-side'), true);
+  assert.equal(host.helpers.isSideChatSession(ctx, 's-plain-fork'), false,
+    'an ordinary user fork must NOT receive the boundary');
   assert.equal(host.helpers.isSideChatSession(ctx, 's-main'), false);
   assert.equal(host.helpers.isSideChatSession(ctx, 's-sub'), false);
   assert.equal(host.helpers.isSideChatSession(ctx, 'missing'), false);
