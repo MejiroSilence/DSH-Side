@@ -1,9 +1,10 @@
 # 计划 v2：Codex 风格侧边聊天（可发现性 / 可恢复性 / 隐藏边界）
 
-> **文档状态**：本文件是 v2 的独立计划稿（2026-11-20），由 v1 验收通过后的复盘与 UX 评审结论整理而成。**批次 A（纯 Client）与批次 B（Host 半部）已实现并通过静态/单测验证；批次 C 未实现。** 批次 B 按用户决定采用「全量：fork 迁到 Host」方案，`index.js` 不再是空 `apply()`，Host 行改名为 `side-chat-v2`，需要 `remove_bundle` + `install_bundle` 生效。
-> **前置**：v1 已完成，[PLAN.md](PLAN.md) 第 6 节全部验收通过（静态检查、18/18 单测、`application: applied`、6 项手工流程、控制台/明暗主题/横向溢出、禁用后入口消失、UX 评审及 6 项修复）。仓库提交 `f4d6580`，`git status` 干净。
-> **项目根目录**：`<path-to-checkout>`（bundle 以 link 方式装在当前 `desktop` profile，仓库即真源）。
-> **运行环境**：`@deepseek-ai/dsh` **0.2.2-rc.5**，`DSH_PROFILE=desktop`，Web bundle 已启用。v2 仍需遵守 `dsh-doc` 技能的 `references/locate-docs.md`：以运行安装为准，实现时逐项复核 API。
+> **文档状态**：**已定稿（2026-11-20）**。批次 A（纯 Client）与批次 B（Host 半部）均已实现、安装并通过验收；**批次 C 经用户决定不做**。本文保留其原始规划仅作记录，下文「建议执行顺序」「批次 C」等章节是当时的设计稿，**不代表待办任务**。
+> **最终实现要点**：v1 用 `ctx.sessions.fork()` 分叉真实子 Session；批次 A 增加 `/side` 命令、右栏引导卡片与首页、可重开的最近列表、嵌套深度上限与截断说明；批次 B 把 developer 边界改为隐藏的 system prompt section —— Client 给子会话打 `Side chat: ` 标题前缀，Host 通过 `title` 投影识别，**普通手动 fork 不受影响**。创建过程不经过 session command（该通道会往主会话日志写命令事件，已不作为主路径）。Host 行改名为 `side-chat-v2` 并带 Config schema；改 Host 代码需 `remove_bundle` + `install_bundle` 或重启 DSH，只改 Client 需完全退出并重开应用。
+> **前置与验收**：v1 已完成，[PLAN.md](PLAN.md) 第 6 节全部验收通过（静态检查、单测、`application: applied`、6 项手工流程、控制台/明暗主题/横向溢出、禁用后入口消失、UX 评审）。v2 最终状态：静态检查通过、**49/49 单测通过**、`application: applied` 且 `warnings: []`、`include:side-chat-v2` enabled/active；用户手工验收 3 项（草稿不含说明文字、子会话标题带 `Side chat: `、普通 fork 不受影响）均通过。仓库提交 `670c7a9`，`git status` 干净。
+> **项目根目录**：`<path-to-checkout>`（bundle 以 link 方式装在当前 `desktop` profile，仓库即真源；**请勿删除或移动该目录**，否则插件失效）。
+> **运行环境**：`@deepseek-ai/dsh` **0.2.2-rc.5**，`DSH_PROFILE=desktop`，Web bundle 已启用。实现时按 `dsh-doc` 技能的 `references/locate-docs.md` 逐项复核了运行安装的 API。
 
 ---
 
@@ -130,7 +131,7 @@
 
 - `index.js` 增加 `export const Config`（z schema），字段建议：`hiddenBoundary: boolean`、`ephemeral: boolean`（默认 **false**）、`maxDepth: number`、`recentLimit: number`、`successNotice: boolean`。字段进 `cordis.patch.yml` 行 `config`，用户的 patch 层在升级后仍存活。
 - **换名**：`cordis.patch.yml` 的 `id: side-chat` → 新值（如 `id: side-chat-v2`）。按约束 7/8，其它标识全部不变；`list_plugins` 的 entryId 变为 `include:side-chat-v2`。
-- 生效方式：`remove_bundle @local/dsh-side-chat` → `install_bundle <path-to-checkout>`（换行名）→ 读 `application: applied` → 刷新页面；或重启 DSH。
+- 生效方式：`remove_bundle @local/dsh-side-chat` → `install_bundle <path-to-checkout>`（换行名）→ 读 `application: applied` → 完全退出并重开 DSH 应用；或重启 DSH。
 - 回滚：`remove_bundle` 后把行名改回 `side-chat` 且移除 Host 面，再 install。
 
 ---
@@ -207,7 +208,7 @@
 - 批次 A：纯 Client 改动，链接目录即真源，**刷新页面**即可，无 profile 写操作。
 - 批次 B：`index.js` 有实际注册 → 影响该 profile 所有会话并持久保存；必须 `remove_bundle` + `install_bundle`（换行名）或重启 DSH。
 - 批次 C 的 `ephemeral` 会**删除**用户 Session（默认关闭）；README 与 `meta.description` 必须明示风险。
-- 回滚到 v1：`remove_bundle @local/dsh-side-chat` → 把 `cordis.patch.yml` 行名改回 `side-chat`、移除 Host 面与 Config → 重新 install → 刷新页面。或 `git revert` 到 `f4d6580` 后 install。
+- 回滚到 v1：`remove_bundle @local/dsh-side-chat` → 把 `cordis.patch.yml` 行名改回 `side-chat`、移除 Host 面与 Config → 重新 install → 完全退出并重开应用。或把仓库回退到 v1 的提交后重新 install。
 - 完全卸载：`plugin_manager action=remove_bundle target=@local/dsh-side-chat` + 刷新。
 
 ---
