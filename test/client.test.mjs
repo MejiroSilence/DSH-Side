@@ -1,0 +1,482 @@
+/**
+ * Unit tests for the real `client.js`, loaded through `vm` with a fake
+ * `window.__ModuleLoader__`. No DSH package, DOM or React renderer is needed:
+ * the module table's `require('react')` is satisfied with a tiny stub.
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
+
+const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8');
+
+const fakeReact = {
+  Fragment: Symbol('React.Fragment'),
+  createElement(type, props, ...children) {
+    return { type, props: props ?? {}, children };
+  },
+  useEffect() {},
+  useState(initialValue) { return [initialValue, () => {}]; },
+};
+
+function loadPlugin() {
+  let factory;
+  const sandbox = {
+    window: {
+      __ModuleLoader__: {
+        load(registration) { factory = registration.factory; },
+      },
+    },
+    URL,
+    URLSearchParams,
+    AbortController,
+    AbortSignal,
+    console,
+  };
+  runInNewContext(source, sandbox, { filename: 'client.js' });
+  return factory(specifier => (specifier === 'react' ? fakeReact : {}));
+}
+
+function writableBinding() {
+  return { session: { getSnapshot: () => ({ removed: false, subagent: null }) }, ctx: {} };
+}
+
+/** A minimal fake of the Client root context and its injected scope. */
+function createFakeCtx() {
+  const captured = {
+    interactions: [],
+    resources: [],
+    tabs: [],
+    slotRegistrations: [],
+    opened: [],
+    notices: [],
+    draftInits: [],
+    released: 0,
+    dismissed: 0,
+    cleared: 0,
+    bindings: { 'parent-1': writableBinding() },
+  };
+  const dispose = () => {};
+  const t = key => `t:${key}`;
+
+  const ctx = {
+    locale: {
+      bind: () => t,
+      register: () => dispose,
+    },
+    uiConversation: {
+      interactions: {
+        register(definition) { captured.interactions.push(definition); return dispose; },
+      },
+    },
+    sessions: {
+      binding: id => captured.bindings[id],
+      fork: async () => 'child-1',
+      retain: () => ({
+        binding: { sessionId: 'child-1', ctx: {} },
+        release() { captured.released += 1; },
+      }),
+      using: async () => undefined,
+    },
+    sidebarRight: {
+      openResource(address, options) { captured.opened.push({ address, options }); },
+    },
+    slots: {
+      inject(name, factory) {
+        factory();
+        return dispose;
+      },
+      register(options, component) {
+        captured.slotRegistrations.push({ name: options.name, options, component });
+        return dispose;
+      },
+    },
+    get(name) {
+      if (name !== 'conversation') return undefined;
+      return {
+        input: {
+          for: () => ({ notify: (level, text) => captured.notices.push({ level, text }) }),
+          requestDraftInitialization(binding, options) {
+            captured.draftInits.push({ binding, options });
+            return 'applied';
+          },
+        },
+      };
+    },
+    effect(factory) {
+      const result = factory();
+      return typeof result === 'function' ? result : dispose;
+    },
+    inject(names, callback) {
+      callback(scope);
+      return dispose;
+    },
+  };
+
+  const scope = {
+    ...ctx,
+    resources: { register(provider) { captured.resources.push(provider); return dispose; } },
+    sidebarRightTabs: { register(definition) { captured.tabs.push(definition); return dispose; } },
+    get: ctx.get,
+  };
+
+  return { ctx, captured, t };
+}
+
+function findActions(captured) {
+  return captured.slotRegistrations.find(entry => entry.name === 'conversation.chat.text-interaction');
+}
+
+function findTab(captured) {
+  return captured.slotRegistrations.find(entry => entry.name === 'sidebar.right.pane.tab');
+}
+
+function actionProps(captured, overrides = {}) {
+  return {
+    sessionId: 'parent-1',
+    inputActions: { insertQuote: () => true },
+    useSession: selector => selector({ removed: false, subagent: null }),
+    t: key => `t:${key}`,
+    dismiss: () => { captured.dismissed += 1; },
+    readText: () => 'selected text',
+    clearSelection: () => { captured.cleared += 1; },
+    trigger: 'contextmenu',
+    ...overrides,
+  };
+}
+
+async function settle() {
+  await new Promise(resolve => setTimeout(resolve, 0));
+}
+
+const face = loadPlugin();
+const helpers = face.helpers;
+
+/** Values created inside `vm` have foreign prototypes; normalize before deepEqual. */
+function plain(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+// ---------------------------------------------------------------------------
+// Address helpers
+// ---------------------------------------------------------------------------
+
+test('plugin face exports inject, apply and the pure helpers', () => {
+  assert.ok(Array.isArray(face.inject));
+  assert.equal(typeof face.apply, 'function');
+  for (const key of [
+    'encodeAddress', 'parseAddress', 'capText', 'quoteBlock', 'firstLine',
+    'buildOpeningDraft', 'admitInteraction', 'waitForAbort',
+  ]) {
+    assert.equal(typeof helpers[key], 'function', `${key} must be exported`);
+  }
+});
+
+test('encodeAddress/parseAddress round-trip and canonical form', () => {
+  const address = helpers.encodeAddress({
+    child: 'child/with space', parent: 'parent-1', label: 'First line',
+  });
+  assert.ok(address.startsWith('dsh-resource://sidechat/session/'));
+  assert.deepEqual(plain(helpers.parseAddress(address)), {
+    child: 'child/with space', parent: 'parent-1', label: 'First line',
+  });
+  assert.deepEqual(plain(helpers.parseAddress('dsh-resource://SIDECHAT/session/c?parent=p')), {
+    child: 'c', parent: 'p', label: '',
+  });
+});
+
+test('parseAddress rejects foreign, malformed and incomplete addresses', () => {
+  const invalid = [
+    '',
+    'not a url',
+    'https://example.com/session/c?parent=p',
+    'dsh-resource://subagentchat/session/c?parent=p',
+    'dsh-resource://sidechat/session/c',                    // no parent
+    'dsh-resource://sidechat/session/c?parent=',            // empty parent
+    'dsh-resource://sidechat/session/c/extra?parent=p',     // extra path part
+    'dsh-resource://sidechat/other/c?parent=p',             // wrong first part
+    'dsh-resource://sidechat/session/%E0%A4%A?parent=p',   // bad percent encoding
+    null,
+    42,
+  ];
+  for (const value of invalid) {
+    assert.equal(helpers.parseAddress(value), undefined, `should reject ${String(value)}`);
+  }
+  assert.equal(helpers.encodeAddress({ child: 'c' }), undefined);
+  assert.equal(helpers.encodeAddress({ parent: 'p' }), undefined);
+  assert.equal(helpers.encodeAddress({ child: '', parent: 'p' }), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Text helpers
+// ---------------------------------------------------------------------------
+
+test('capText truncates at 8000 by default and at a custom limit', () => {
+  assert.equal(helpers.capText('abc'), 'abc');
+  assert.equal(helpers.capText('x'.repeat(9000)).length, 8000);
+  assert.equal(helpers.capText('abcdef', 3), 'abc');
+  assert.equal(helpers.capText('abc', 0), 'abc');
+});
+
+test('capText never splits a UTF-16 surrogate pair', () => {
+  // '😀' is a high+low surrogate pair; a naive slice(0, 3) would leave a lone high surrogate.
+  const text = 'ab😀cd';
+  const capped = helpers.capText(text, 3);
+  assert.equal(capped, 'ab');
+  assert.equal(capped.charCodeAt(capped.length - 1), 'b'.charCodeAt(0));
+  assert.equal(helpers.capText(text, 4), 'ab😀');
+});
+
+test('quoteBlock prefixes every line and normalizes CRLF', () => {
+  assert.equal(helpers.quoteBlock('one\r\ntwo\rthree'), '> one\n> two\n> three');
+  assert.equal(helpers.quoteBlock('single'), '> single');
+  assert.equal(helpers.quoteBlock('a\n\nb'), '> a\n> \n> b');
+});
+
+test('firstLine skips blank lines and truncates with an ellipsis', () => {
+  assert.equal(helpers.firstLine('\n\n  Hello world  \nsecond'), 'Hello world');
+  assert.equal(helpers.firstLine('x'.repeat(40), 10), `${'x'.repeat(10)}…`);
+  assert.equal(helpers.firstLine(''), '');
+});
+
+test('buildOpeningDraft contains a blockquote and the localized boundary note', () => {
+  const draft = helpers.buildOpeningDraft('alpha\nbeta', key => `T(${key})`);
+  assert.equal(draft, '> alpha\n> beta\n\nT(draft.boundary)');
+  assert.ok(draft.includes('> alpha'));
+  assert.ok(draft.includes('boundary'));
+});
+
+// ---------------------------------------------------------------------------
+// Interaction admission
+// ---------------------------------------------------------------------------
+
+test('admitInteraction claims only contextmenu with text in a writable Session', () => {
+  const binding = writableBinding();
+  const request = (trigger, text) => ({ trigger, readText: () => text });
+  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), binding), true);
+  assert.equal(helpers.admitInteraction(request('selection', 'x'), binding), false);
+  assert.equal(helpers.admitInteraction(request('contextmenu', null), binding), false);
+  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), undefined), false);
+  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), {
+    session: { getSnapshot: () => ({ removed: true, subagent: null }) },
+  }), false);
+  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), {
+    session: { getSnapshot: () => ({ removed: false, subagent: { address: { mode: 'one-shot' } } }) },
+  }), false);
+  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), {
+    session: { getSnapshot: () => ({ removed: false, subagent: { address: { mode: 'continuable' } } }) },
+  }), true);
+});
+
+// ---------------------------------------------------------------------------
+// apply(): registered interaction, tab type, resource provider
+// ---------------------------------------------------------------------------
+
+test('apply registers the side-chat interaction with the message-quotes gate', () => {
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+
+  assert.equal(captured.interactions.length, 1);
+  const definition = captured.interactions[0];
+  assert.equal(definition.id, 'side-chat');
+
+  let opened = 0;
+  let prevented = 0;
+  const request = {
+    trigger: 'contextmenu',
+    sessionId: 'parent-1',
+    readText: () => 'x',
+    open: () => { opened += 1; },
+    preventDefault: () => { prevented += 1; },
+  };
+  definition.onInteraction(request);
+  assert.equal(opened, 1, 'writable contextmenu selection is claimed');
+  assert.equal(prevented, 1, 'the native context menu is suppressed when claimed');
+
+  definition.onInteraction({ ...request, trigger: 'selection' });
+  definition.onInteraction({ ...request, readText: () => null });
+  definition.onInteraction({ ...request, sessionId: 'missing' });
+  assert.equal(opened, 1, 'selection, empty text and missing binding are ignored');
+  assert.equal(prevented, 1, 'unclaimed gestures keep the browser default');
+
+  captured.bindings['parent-1'] = {
+    session: { getSnapshot: () => ({ removed: true, subagent: null }) },
+  };
+  definition.onInteraction(request);
+  captured.bindings['parent-1'] = {
+    session: { getSnapshot: () => ({ removed: false, subagent: { address: { mode: 'one-shot' } } }) },
+  };
+  definition.onInteraction(request);
+  assert.equal(opened, 1, 'removed and one-shot Sessions are refused');
+
+  captured.bindings['parent-1'] = {
+    session: { getSnapshot: () => ({ removed: false, subagent: { address: { mode: 'continuable' } } }) },
+  };
+  definition.onInteraction(request);
+  assert.equal(opened, 2, 'continuable subagent Sessions are admitted');
+});
+
+test('apply registers a sidechat tab type with a parsed title', () => {
+  const { ctx, captured, t } = createFakeCtx();
+  face.apply(ctx);
+  assert.equal(captured.tabs.length, 1);
+  const tab = captured.tabs[0];
+  assert.equal(tab.id, '@local/dsh-side-chat');
+  assert.equal(tab.kind, 'sidechat');
+  assert.equal(tab.priority, 'extension');
+  assert.deepEqual(plain(tab.patterns), ['dsh-resource://sidechat/**']);
+
+  const address = helpers.encodeAddress({ child: 'c', parent: 'p', label: 'A question' });
+  assert.equal(tab.canOpen(address), true);
+  assert.equal(tab.canOpen('dsh-resource://sidechat/session/c'), false);
+  assert.equal(tab.title(address), 'A question');
+  assert.equal(tab.title(helpers.encodeAddress({ child: 'c', parent: 'p' })), t('tab.title'));
+});
+
+test('apply registers the actions, tab body and conversation slot without a global bridge', () => {
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const names = captured.slotRegistrations.map(entry => entry.name);
+  assert.ok(names.includes('conversation.chat.text-interaction'));
+  assert.ok(names.includes('sidebar.right.pane.tab'));
+  assert.ok(names.includes('sidechat.conversation'));
+  assert.equal(captured.resources.length, 1);
+  assert.equal(captured.resources[0].protocol, 'sidechat');
+});
+
+// ---------------------------------------------------------------------------
+// Main flow: right-click "Ask in side chat" -> fork -> open resource -> prefill
+// ---------------------------------------------------------------------------
+
+test('quote action inserts a blockquote without sending and dismisses', () => {
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const actions = findActions(captured);
+  const tree = actions.component(actionProps(captured));
+  const buttons = tree.children[1].children;
+  assert.equal(buttons.length, 2);
+  buttons[0].props.onClick();
+  assert.equal(captured.cleared, 1);
+  assert.equal(captured.dismissed, 1);
+  assert.equal(captured.opened.length, 0, 'quote must not fork or open a tab');
+});
+
+test('side chat action forks, opens a tab and prefills the draft exactly once', async () => {
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const actions = findActions(captured);
+  const tree = actions.component(actionProps(captured));
+  const buttons = tree.children[1].children;
+
+  buttons[1].props.onClick();
+  await settle();
+
+  assert.equal(captured.opened.length, 1, 'one resource is opened');
+  assert.deepEqual(plain(captured.opened[0].options), { kind: 'sidechat', preferNewPane: true });
+  const parsed = helpers.parseAddress(captured.opened[0].address);
+  assert.equal(parsed.child, 'child-1');
+  assert.equal(parsed.parent, 'parent-1');
+  assert.equal(parsed.label, 'selected text');
+  assert.equal(captured.cleared, 1);
+  assert.equal(captured.dismissed, 1);
+
+  const provider = captured.resources[0];
+  const controller = new AbortController();
+  const iterator = provider.open(captured.opened[0].address, { signal: controller.signal });
+  const first = await iterator.next();
+  assert.equal(first.done, false);
+  assert.equal(first.value.ok, true);
+  assert.equal(first.value.value.child, 'child-1');
+  assert.equal(captured.draftInits.length, 1, 'draft is initialized while the tab holds the reference');
+  assert.equal(captured.draftInits[0].options.prompt, '> selected text\n\nt:draft.boundary');
+  assert.equal(captured.draftInits[0].options.whenDraftExists, 'append');
+
+  controller.abort();
+  const second = await iterator.next();
+  assert.equal(second.done, true, 'the stream ends on abort');
+  assert.equal(captured.released, 1, 'the child reference is released');
+
+  // Revealing the same tab again must not prefill a second time.
+  const again = captured.resources[0].open(captured.opened[0].address, { signal: new AbortController().signal });
+  await again.next();
+  assert.equal(captured.draftInits.length, 1);
+  await again.return();
+});
+
+test('resource provider rejects an invalid address', async () => {
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const provider = captured.resources[0];
+  const iterator = provider.open('dsh-resource://sidechat/session/c', { signal: new AbortController().signal });
+  await assert.rejects(() => iterator.next(), /invalid resource address/);
+  assert.equal(captured.released, 0);
+});
+
+test('fork failure shows a localized notice and opens no tab', async () => {
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  ctx.sessions.fork = async () => { throw new Error('fork unavailable'); };
+  const actions = findActions(captured);
+  const buttons = actions.component(actionProps(captured)).children[1].children;
+  buttons[1].props.onClick();
+  await settle();
+
+  assert.equal(captured.opened.length, 0, 'no empty tab on failure');
+  assert.equal(captured.cleared, 0, 'selection is kept on failure');
+  assert.equal(captured.dismissed, 0);
+  assert.equal(captured.notices.length, 1);
+  assert.equal(captured.notices[0].level, 'error');
+  assert.equal(captured.notices[0].text, 't:error.fork');
+});
+
+test('migration-required fork failure uses the migration-specific message', async () => {
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  ctx.sessions.fork = async () => {
+    const error = new Error('migration required');
+    error.name = 'SessionForkError';
+    error.rpcError = { code: 'session/migration-required' };
+    throw error;
+  };
+  const actions = findActions(captured);
+  const buttons = actions.component(actionProps(captured)).children[1].children;
+  buttons[1].props.onClick();
+  await settle();
+  assert.equal(captured.notices[0].text, 't:error.migration');
+});
+
+// ---------------------------------------------------------------------------
+// Tab body states: loading, failure, and a live reference
+// ---------------------------------------------------------------------------
+
+test('tab body shows localized loading, failure and live Chat states', () => {
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const tabBody = findTab(captured);
+  const baseProps = {
+    useTabInfo: () => ({ tab: { contentId: 'dsh-resource://sidechat/session/c?parent=p' } }),
+    SessionProvider: () => null,
+    renderSlot: () => 'CHAT',
+  };
+
+  const loading = tabBody.component({
+    ...baseProps,
+    useResource: () => ({ status: 'loading', value: undefined, failure: undefined }),
+  });
+  assert.equal(loading.children[0].children[0], 't:tab.loading');
+
+  const failed = tabBody.component({
+    ...baseProps,
+    useResource: () => ({ status: 'failed', value: undefined, failure: { message: 'boom' } }),
+  });
+  assert.equal(failed.children[0].children[0], 't:tab.failed', 'no endless loading on a failed resource');
+
+  const reference = {};
+  const live = tabBody.component({
+    ...baseProps,
+    useResource: () => ({ status: 'live', value: { child: 'c', parent: 'p', label: '', reference }, failure: undefined }),
+  });
+  assert.equal(live.children[0].type, baseProps.SessionProvider);
+  assert.equal(live.children[0].props.session, reference);
+  assert.equal(live.children[0].children[0], 'CHAT');
+});
