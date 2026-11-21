@@ -1,10 +1,11 @@
 /**
  * Browser half of the Codex-style Side Chat bundle.
  *
- * A right-click on a Chat text selection claims the `contextmenu` gesture (the
- * built-in `message-quotes` plugin keeps `selection`), and offers two actions:
- * quote into the current composer, or fork a real child Session and show its
- * Chat in a right-Sidebar tab. Nothing is sent automatically.
+ * Selecting text in a Chat automatically surfaces two actions: quote into the
+ * current composer, or fork a real child Session and show its Chat in a
+ * right-Sidebar tab. The `contextmenu` gesture is deliberately not claimed, so
+ * the browser's native menu stays available for copying. Nothing is sent
+ * automatically.
  *
  * v2 batch A adds three more entry points and recovery: a `/side` command, a
  * right-Sidebar guide capsule + home page, and a "recent side chats" list that
@@ -129,7 +130,7 @@ window.__ModuleLoader__.load({
       return `${quote}${truncation}`;
     }
 
-    /** Shared writable-Session gate for both the right-click and `/side`. */
+    /** Shared writable-Session gate for the selection surface and `/side`. */
     function writableSession(binding) {
       if (binding === undefined || binding === null || binding.session === undefined) return false;
       const session = binding.session.getSnapshot();
@@ -141,11 +142,11 @@ window.__ModuleLoader__.load({
 
     /**
      * Mirror the built-in Quote plugin's writable-Session gate. Only a
-     * `contextmenu` gesture with a real text selection in a continuable Session
-     * is admitted; drag-selection stays with `message-quotes`.
+     * `selection` gesture with a real text selection in a continuable Session
+     * is admitted. `contextmenu` is left to the browser's native menu.
      */
     function admitInteraction(request, binding) {
-      if (request === undefined || request === null || request.trigger !== 'contextmenu') return false;
+      if (request === undefined || request === null || request.trigger !== 'selection') return false;
       if (typeof request.readText !== 'function' || request.readText() === null) return false;
       return writableSession(binding);
     }
@@ -238,10 +239,10 @@ window.__ModuleLoader__.load({
       'guide.title': '侧边聊天',
       'guide.description': '打开侧边聊天首页：新建侧边聊天，或重新打开最近的一个。',
       'home.title': '侧边聊天',
-      'home.intro': '在聊天里选中文字并右键可选择「在侧边聊天中提问」，也可以输入 /side，或直接在下方新建一个空白侧边聊天。',
+      'home.intro': '在聊天里框选文字即可选择「在侧边聊天中提问」，也可以输入 /side，或直接在下方新建一个空白侧边聊天。',
       'home.new': '新建空白侧边聊天',
       'home.recent': '最近的侧边聊天',
-      'home.empty': '还没有侧边聊天。新建一个，或从聊天里右键选段开始。',
+      'home.empty': '还没有侧边聊天。新建一个，或从聊天里框选一段文字开始。',
       'home.missing': '这个子会话已不在会话列表中，记录已移除。',
       'home.untitled': '空白侧边聊天',
       'home.open': '重新打开',
@@ -267,10 +268,10 @@ window.__ModuleLoader__.load({
       'guide.title': 'Side chat',
       'guide.description': 'Open the side chat home page: start a new one or reopen a recent one.',
       'home.title': 'Side chat',
-      'home.intro': 'Select text in a chat and right-click it to "Ask in side chat", type /side, or start a blank side chat below.',
+      'home.intro': 'Select text in a chat to "Ask in side chat", type /side, or start a blank side chat below.',
       'home.new': 'New blank side chat',
       'home.recent': 'Recent side chats',
-      'home.empty': 'No side chats yet. Create one, or start from a right-click on selected text.',
+      'home.empty': 'No side chats yet. Create one, or start by selecting text in a chat.',
       'home.missing': 'That child Session is no longer in the session list; the entry was removed.',
       'home.untitled': 'Blank side chat',
       'home.open': 'Reopen',
@@ -436,13 +437,11 @@ window.__ModuleLoader__.load({
         id: INTERACTION_ID,
         onInteraction(request) {
           if (!admitInteraction(request, ctx.sessions.binding(request.sessionId))) return;
-          // The host only exposes preventDefault to plugins; it never cancels
-          // the browser event itself. Claiming the gesture means showing our
-          // own surface instead of the native context menu.
-          request.preventDefault();
+          // Selection gestures must not cancel browser defaults, and we no
+          // longer claim `contextmenu` at all (native menu stays usable).
           request.open();
         },
-      }), 'side-chat: contextmenu interaction');
+      }), 'side-chat: selection interaction');
 
       /** Best-effort localized notice on the parent Session's composer. */
       function notify(sessionId, level, message) {
@@ -667,14 +666,33 @@ window.__ModuleLoader__.load({
         );
       }
 
+      // The interaction dispatch returns the FIRST definition that opens. The
+      // built-in `message-quotes` registers `selection` before us (Loader rows
+      // are appended), so a selection normally dispatches under `quote`. We
+      // therefore register our two-button surface under `key: 'quote'` with a
+      // priority that shadows the built-in single-button action. A second
+      // entry under our own id is the fallback for when the built-in definition
+      // is absent and our own selection definition wins the dispatch.
+      ctx.effect(() => {
+        const dispose = ctx.slots.inject('conversation.chat.text-interaction', () => ctx.slots.register({
+          name: 'conversation.chat.text-interaction',
+          key: 'quote',
+          id: 'side-chat-selection',
+          priority: -100,
+          locale: NS,
+        }, SideChatActions));
+        return typeof dispose === 'function' ? dispose : () => {};
+      }, 'side-chat: selection surface (quote key)');
+
       ctx.effect(() => {
         const dispose = ctx.slots.inject('conversation.chat.text-interaction', () => ctx.slots.register({
           name: 'conversation.chat.text-interaction',
           key: INTERACTION_ID,
+          id: 'side-chat-fallback',
           locale: NS,
         }, SideChatActions));
         return typeof dispose === 'function' ? dispose : () => {};
-      }, 'side-chat: text interaction actions');
+      }, 'side-chat: fallback surface');
 
       // v2: /side command. `commandUi` is optional via ctx.inject so a profile
       // without the commands package parks only this entry, not the plugin.

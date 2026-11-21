@@ -1,8 +1,8 @@
 # 计划 v2：Codex 风格侧边聊天（可发现性 / 可恢复性 / 隐藏边界）
 
 > **文档状态**：**已定稿（2026-11-20）**。批次 A（纯 Client）与批次 B（Host 半部）均已实现、安装并通过验收；**批次 C 经用户决定不做**。本文保留其原始规划仅作记录，下文「建议执行顺序」「批次 C」等章节是当时的设计稿，**不代表待办任务**。
-> **最终实现要点**：v1 用 `ctx.sessions.fork()` 分叉真实子 Session；批次 A 增加 `/side` 命令、右栏引导卡片与首页、可重开的最近列表、嵌套深度上限与截断说明；批次 B 把 developer 边界改为隐藏的 system prompt section —— Client 给子会话打 `Side chat: ` 标题前缀，Host 通过 `title` 投影识别，**普通手动 fork 不受影响**。创建过程不经过 session command（该通道会往主会话日志写命令事件，已不作为主路径）。Host 行改名为 `side-chat-v2` 并带 Config schema；改 Host 代码需 `remove_bundle` + `install_bundle` 或重启 DSH，只改 Client 需完全退出并重开应用。
-> **前置与验收**：v1 已完成，[PLAN.md](PLAN.md) 第 6 节全部验收通过（静态检查、单测、`application: applied`、6 项手工流程、控制台/明暗主题/横向溢出、禁用后入口消失、UX 评审）。v2 最终状态：静态检查通过、**49/49 单测通过**、`application: applied` 且 `warnings: []`、`include:side-chat-v2` enabled/active；用户手工验收 3 项（草稿不含说明文字、子会话标题带 `Side chat: `、普通 fork 不受影响）均通过。仓库提交 `670c7a9`，`git status` 干净。
+> **最终实现要点**：v1 用 `ctx.sessions.fork()` 分叉真实子 Session；批次 A 增加 `/side` 命令、右栏引导卡片与首页、可重开的最近列表、嵌套深度上限与截断说明；批次 B 把 developer 边界改为隐藏的 system prompt section —— Client 给子会话打 `Side chat: ` 标题前缀，Host 通过 `title` 投影识别，**普通手动 fork 不受影响**。创建过程不经过 session command（该通道会往主会话日志写命令事件，已不作为主路径）。Host 行改名为 `side-chat-v2` 并带 Config schema；改 Host 代码需 `remove_bundle` + `install_bundle` 或重启 DSH，只改 Client 需完全退出并重开应用。**后续（2026-11-22）把入口改为 Codex 式：框选文本自动弹出双按钮浮层，`contextmenu` 不再认领（右键恢复浏览器原生菜单）；因 dispatch 注册顺序无法抢占，改用 `key:'quote'` + `priority:-100` 的 slot entry 遮蔽内置单按钮「引用文本」，并以 `key:'side-chat'` 兜底，两者共用同一组件。**
+> **前置与验收**：v1 已完成，[PLAN.md](PLAN.md) 第 6 节全部验收通过（静态检查、单测、`application: applied`、6 项手工流程、控制台/明暗主题/横向溢出、禁用后入口消失、UX 评审）。v2 最终状态：静态检查通过、**50/50 单测通过**、`application: applied` 且 `warnings: []`、`include:side-chat-v2` enabled/active；历次用户手工验收见各次交付报告。**本次（框选自动弹出双按钮 / 右键恢复原生菜单）待用户完全退出并重开 DSH 应用后确认。** `git status` 干净，提交历史见 `git log`。
 > **项目根目录**：`<path-to-checkout>`（bundle 以 link 方式装在当前 `desktop` profile，仓库即真源；**请勿删除或移动该目录**，否则插件失效）。
 > **运行环境**：`@deepseek-ai/dsh` **0.2.2-rc.5**，`DSH_PROFILE=desktop`，Web bundle 已启用。实现时按 `dsh-doc` 技能的 `references/locate-docs.md` 逐项复核了运行安装的 API。
 

@@ -2,7 +2,7 @@
 
 [中文文档](README.zh.md) | English
 
-A small DSH Web plugin that adds a **Codex-style side chat** to the Chat view. Right-click a selected piece of chat text and you get two actions:
+A small DSH Web plugin that adds a **Codex-style side chat** to the Chat view. Selecting a piece of chat text automatically surfaces two actions:
 
 | Action | What it does |
 | --- | --- |
@@ -25,15 +25,15 @@ Rollback: `plugin_manager action=remove_bundle target=@local/dsh-side-chat`, the
 
 ## Use
 
-1. In a Chat with content, **select some text and right-click it**. (A plain drag-selection still belongs to the built-in **Quote text** action; this plugin only claims the `contextmenu` gesture, so the two never fight over the same gesture.)
+1. In a Chat with content, **select some text**. A floating surface with two actions appears automatically — no right-click needed. Right-click keeps the browser's native menu, so you can copy the selection normally.
 2. **Quote in current chat** → the composer gains a blockquote; the message is not sent.
-3. **Ask in side chat** → a real child Session is created and appears in the session list; a `sidechat` Chat tab opens on the right; its draft contains the quoted selection plus a visible boundary note, still unsent.
+3. **Ask in side chat** → a real child Session is created and appears in the session list; a `sidechat` Chat tab opens on the right; its draft contains only the quoted selection (the developer boundary is hidden in the system prompt), still unsent.
 4. Type anything you like and press **Enter** in the side chat to actually run a model turn (including tool calls). Closing the tab leaves the main Session untouched.
 
 ## What the side chat actually is
 
 - A **normal Session** created with `ctx.sessions.fork()` (no `atSeq` → fork from the latest completed-turn prefix). It stays in the session list; closing the tab does **not** delete it. It is not ephemeral.
-- The selected text is capped at 8000 characters and prefilled as a Markdown blockquote, followed by a **visible** localized boundary note explaining that inherited history is reference only, that the parent task is not to be continued, and that files/tools should not be touched unless asked.
+- The selected text is capped at 8000 characters and prefilled as a Markdown blockquote. The developer boundary (inherited history is reference only; do not continue the parent task; do not change files or run tools unless asked) is delivered as a **hidden** system-prompt section, not written into the draft.
 - The tab body reuses the shared Conversation assembly (`conversation.content` with `variant: 'embedded'`) with a fixed Chat view, wrapped in a `SessionProvider` around a `sessions.retain()` reference. That reference is released when the tab closes or the plugin unloads.
 - Draft initialization happens while the tab's own reference is held, so the draft survives scope teardown and is not repeated when an existing tab is revealed again.
 
@@ -43,7 +43,7 @@ Rollback: `plugin_manager action=remove_bundle target=@local/dsh-side-chat`, the
 
 | Entry | What it does |
 | --- | --- |
-| **Right-click inside a selection** | The original two-button surface (Quote / Ask in side chat) |
+| **Select text in a Chat** | The two-button surface appears automatically (Quote in current chat / Ask in side chat) |
 | **`/side`** | Slash command that forks a blank side chat from the current session |
 | **Right-Sidebar guide capsule** | Opens the **Side chat** home page |
 | **Home page** | Explains the flows, starts a blank side chat, lists **Recent side chats** |
@@ -51,7 +51,7 @@ Rollback: `plugin_manager action=remove_bundle target=@local/dsh-side-chat`, the
 - **Recent side chats** live in browser `localStorage` (`dsh.sidechat.recent`, 20 entries max). Closing a tab does not delete the child; clicking an entry calls `openResource` on the **same address**, so the existing tab is revealed — no new fork, no duplicate draft. An entry whose child is no longer in the session list is removed with a localized notice.
 - `/side` and the home page create a blank side chat: the draft has a localized "no selection" line and no empty blockquote. After batch B it carries no boundary note either.
 - **Recursion is capped at 3 levels** (`depth` in the address; v1 addresses parse as depth 0, so old tabs still work). Forking from a too-deep side chat shows a localized error instead of creating a grandchild.
-- **Truncated selections get a visible note** after the boundary, never inside the quoted text.
+- **Truncated selections get a visible note** after the quote, never inside the quoted text.
 - A failed tab open still records the child **together with its staged prompt**, so retrying from the home page restores the original quoted selection instead of opening an empty draft. The prompt is cleared once the retry succeeds.
 - Batch A is **Client-only**: no Host changes, no Config schema, no new Session events, no new row name. A page refresh is enough.
 
@@ -106,20 +106,20 @@ no longer used by the Web UI — a session command writes `command/run` /
 | Hidden developer/system boundary between inherited history and the new question | A **hidden** system-prompt section on forked Sessions (batch B) |
 | Ephemeral side thread discarded on close | A **persistent** Session in the list |
 | Only new turns after the boundary are shown | Inherited history is visible in the child Session |
-| `chatgpt.addToThread` | The same floating surface's **Quote in current chat** action (plus the built-in drag-selection quote) |
+| `chatgpt.addToThread` | The same floating surface's **Quote in current chat** action (it replaces the built-in single-button Quote text action on selection) |
 | `/side` command, side-chat picker, agent tool | `/side` + guide capsule + home page (batch A); agent tool is batch B |
 
 Still **not** implemented (see [PLAN.v2.md](PLAN.v2.md)): custom child titles, more languages, auto-archiving on close, boundary-only turn filtering, publishing to npm / a plugin market. Batch C also covers `maxDepth` / `recentLimit` Config and persisting the hidden boundary across restarts.
 
 ## UX notes and current limitations
 
-- **Right-click still only works inside the selection rect**; outside it the native browser menu stays. Claiming the gesture calls `preventDefault()`, so copy with Cmd/Ctrl+C or drag-selection. Drag-selection still belongs to the built-in **Quote text**.
-- **While `sessions.fork()` is in flight** the two buttons are disabled and the second reads "Creating side chat…". On failure a localized error notice appears on the parent composer, no empty tab opens, and the selection stays. On success the surface dismisses and the tab opens — there is still **no success toast** (a `successNotice` Config switch is planned for batch B).
+- **Selection, not right-click, opens the surface.** Right-click anywhere keeps the browser's native menu (copy/paste work normally). The built-in single-button **Quote text** action is replaced by our two-button surface on selection, so no right-click step is needed.
+- **While `sessions.fork()` is in flight** the two buttons are disabled and the second reads "Creating side chat…". On failure a localized error notice appears on the parent composer, no empty tab opens, and the selection stays. On success the surface dismisses and the tab opens — there is still **no success toast**.
 - The child is a **normal persistent Session**; closing the tab does not delete it. It can now be reopened side-by-side from Recent side chats, but there is no auto-archiving.
 - The tab body shows localized loading and failure states instead of an endless "Opening side chat…".
 - **Selections are capped at 8000 characters** (surrogate pairs are never split in half); a visible truncated note is appended.
-- Right-clicking inside a side chat still works, up to the depth limit.
-- The boundary note in the draft is model-facing instruction text only. The "nothing is sent automatically" guarantee lives in `meta.description` and the README, not in the draft that gets sent.
+- Selecting text inside a side chat also opens the surface, up to the depth limit.
+- The hidden boundary is model-facing instruction text only; the draft that gets sent contains just the quote. The "nothing is sent automatically" guarantee lives in `meta.description` and the README.
 
 ## Differences from `dsh-select-ask`
 

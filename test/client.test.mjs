@@ -179,7 +179,8 @@ function createFakeCtx() {
 }
 
 function findActions(captured) {
-  return captured.slotRegistrations.find(entry => entry.name === 'conversation.chat.text-interaction');
+  return captured.slotRegistrations.find(entry => entry.name === 'conversation.chat.text-interaction'
+    && entry.options.key === 'side-chat');
 }
 
 function findTab(captured) {
@@ -209,7 +210,7 @@ function actionProps(captured, overrides = {}) {
     dismiss: () => { captured.dismissed += 1; },
     readText: () => 'selected text',
     clearSelection: () => { captured.cleared += 1; },
-    trigger: 'contextmenu',
+    trigger: 'selection',
     ...overrides,
   };
 }
@@ -339,20 +340,21 @@ test('buildOpeningDraft contains a blockquote and the localized boundary note', 
 // Interaction admission
 // ---------------------------------------------------------------------------
 
-test('admitInteraction claims only contextmenu with text in a writable Session', () => {
+test('admitInteraction claims only selection with text in a writable Session', () => {
   const binding = writableBinding();
   const request = (trigger, text) => ({ trigger, readText: () => text });
-  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), binding), true);
-  assert.equal(helpers.admitInteraction(request('selection', 'x'), binding), false);
-  assert.equal(helpers.admitInteraction(request('contextmenu', null), binding), false);
-  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), undefined), false);
-  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), {
+  assert.equal(helpers.admitInteraction(request('selection', 'x'), binding), true);
+  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), binding), false,
+    'right-click is never claimed');
+  assert.equal(helpers.admitInteraction(request('selection', null), binding), false);
+  assert.equal(helpers.admitInteraction(request('selection', 'x'), undefined), false);
+  assert.equal(helpers.admitInteraction(request('selection', 'x'), {
     session: { getSnapshot: () => ({ removed: true, subagent: null }) },
   }), false);
-  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), {
+  assert.equal(helpers.admitInteraction(request('selection', 'x'), {
     session: { getSnapshot: () => ({ removed: false, subagent: { address: { mode: 'one-shot' } } }) },
   }), false);
-  assert.equal(helpers.admitInteraction(request('contextmenu', 'x'), {
+  assert.equal(helpers.admitInteraction(request('selection', 'x'), {
     session: { getSnapshot: () => ({ removed: false, subagent: { address: { mode: 'continuable' } } }) },
   }), true);
 });
@@ -361,7 +363,7 @@ test('admitInteraction claims only contextmenu with text in a writable Session',
 // apply(): registered interaction, tab type, resource provider
 // ---------------------------------------------------------------------------
 
-test('apply registers the side-chat interaction with the message-quotes gate', () => {
+test('apply registers the side-chat interaction for selection only', () => {
   const { ctx, captured } = createFakeCtx();
   face.apply(ctx);
 
@@ -372,21 +374,21 @@ test('apply registers the side-chat interaction with the message-quotes gate', (
   let opened = 0;
   let prevented = 0;
   const request = {
-    trigger: 'contextmenu',
+    trigger: 'selection',
     sessionId: 'parent-1',
     readText: () => 'x',
     open: () => { opened += 1; },
     preventDefault: () => { prevented += 1; },
   };
   definition.onInteraction(request);
-  assert.equal(opened, 1, 'writable contextmenu selection is claimed');
-  assert.equal(prevented, 1, 'the native context menu is suppressed when claimed');
+  assert.equal(opened, 1, 'a writable selection is claimed');
+  assert.equal(prevented, 0, 'selection never cancels browser defaults');
 
-  definition.onInteraction({ ...request, trigger: 'selection' });
+  definition.onInteraction({ ...request, trigger: 'contextmenu' });
   definition.onInteraction({ ...request, readText: () => null });
   definition.onInteraction({ ...request, sessionId: 'missing' });
-  assert.equal(opened, 1, 'selection, empty text and missing binding are ignored');
-  assert.equal(prevented, 1, 'unclaimed gestures keep the browser default');
+  assert.equal(opened, 1, 'contextmenu, empty text and missing binding are ignored');
+  assert.equal(prevented, 0, 'preventDefault is never called');
 
   captured.bindings['parent-1'] = {
     session: { getSnapshot: () => ({ removed: true, subagent: null }) },
@@ -403,6 +405,23 @@ test('apply registers the side-chat interaction with the message-quotes gate', (
   };
   definition.onInteraction(request);
   assert.equal(opened, 2, 'continuable subagent Sessions are admitted');
+});
+
+test('both slot surfaces render the same two-button component', () => {
+  const { ctx, captured } = createFakeCtx();
+  face.apply(ctx);
+  const surfaces = captured.slotRegistrations.filter(
+    entry => entry.name === 'conversation.chat.text-interaction',
+  );
+  assert.equal(surfaces.length, 2, 'quote-key main surface + side-chat fallback');
+  const quote = surfaces.find(entry => entry.options.key === 'quote');
+  const fallback = surfaces.find(entry => entry.options.key === 'side-chat');
+  assert.ok(quote && fallback);
+  assert.equal(quote.options.id, 'side-chat-selection');
+  assert.equal(quote.options.priority, -100, 'shadows the built-in single-button action');
+  assert.equal(fallback.options.id, 'side-chat-fallback');
+  assert.equal(quote.component, fallback.component, 'one component for both dispatch ids');
+  assert.equal(quote.component, findActions(captured).component);
 });
 
 test('apply registers a sidechat tab type with a parsed title', () => {
@@ -434,7 +453,7 @@ test('apply registers the actions, tab body and conversation slot without a glob
 });
 
 // ---------------------------------------------------------------------------
-// Main flow: right-click "Ask in side chat" -> fork -> open resource -> prefill
+// Main flow: select text -> "Ask in side chat" -> fork -> open resource -> prefill
 // ---------------------------------------------------------------------------
 
 test('quote action inserts a blockquote without sending and dismisses', () => {

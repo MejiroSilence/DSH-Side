@@ -1,7 +1,7 @@
 # 计划：Codex 风格侧边聊天 DSH 插件
 
-> **文档状态**：本文件是把已讨论的计划落盘的稿件（2026-11-20）。**Git 仓库尚未初始化，插件代码尚未创建，profile 未做任何改动**。下一步需要按本文执行时再动手。
-> **项目根目录**：`<path-to-checkout>`（已存在、当前为空、可写；位于会话默认工作区 `<default-workspace>` 之外）。
+> **文档状态**：本文件是 v1 计划原稿（2026-11-20）。**项目已完成并验收通过**，后续迭代见 [PLAN.v2.md](PLAN.v2.md)。**交互决策以第 23 行「交互决策（2026-11-22 修订）」为准**：框选自动弹出双按钮浮层、右键恢复浏览器原生菜单；正文其余「右键选区」描述是当时的 v1 设计，仅作历史记录。
+> **项目根目录**：`<path-to-checkout>`（bundle 以 link 方式装在当前 `desktop` profile，仓库即真源；请勿删除或移动该目录）。
 
 ---
 
@@ -20,7 +20,7 @@
 - `git 2.54.0`；`node` 不在 PATH，语法检查/测试改用 `ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" --check|--test`。
 - 现有 Web GUI URL 为 `<web-gui-url>`；本轮 cua 浏览器控制调用因参数序列化报错不可用，因此**页面视觉验证能力受限**，会在交付报告中明确说明。
 - 关键 API 均已从源码确认：`ctx.sessions.fork({sessionId, atSeq?, increaseTitle, onCreated})`（省略 `atSeq` = 从最后完成回合分叉）、`ctx.sessions.retain/using`、`ctx.get('conversation').input.requestDraftInitialization(binding, {prompt, whenDraftExists})`、`ctx.resources.register`、`ctx.sidebarRightTabs.register`、`ctx.sidebarRight.openResource(addr,{kind,preferNewPane})`、`ctx.uiConversation.interactions.register`、`ctx.slots.inject`。
-- **重要约束**：`ConversationInteractionRegistry.dispatch` 按注册顺序返回**第一个** `open()` 的插件；`message-quotes` 已占用 `selection` 手势。因此本插件只认领 **`contextmenu`（右键选区）** 手势，拖选仍归内置「引用文本」，二者不冲突。这也顺带避开上一轮讨论的 `dsh-select-ask` 单例桥坑：`sessionId` 从 **session 作用域 slot props** 直接取得，不使用全局 bridge。
+- **交互决策（2026-11-22 修订）**：`ConversationInteractionRegistry.dispatch` 按注册顺序返回**第一个** `open()` 的插件；内置 `message-quotes` 先注册并占用 `selection`，且 Loader patch 的 `insert` 只能追加行、无法把本插件插到它之前。因此本插件改**只认领 `selection` 手势**（不再认领 `contextmenu`，右键恢复浏览器原生菜单），并在 `conversation.chat.text-interaction` 上注册两个 slot entry：`key:'quote'`（`priority:-100`，遮蔽内置单按钮「引用文本」）与 `key:'side-chat'`（兜底，供本插件自己的 definition 赢时渲染），两者都指向同一个双按钮 `SideChatActions`。这顺带避开 `dsh-select-ask` 单例桥坑：`sessionId` 从 **session 作用域 slot props** 直接取得，不使用全局 bridge。
 - 参考实现：[subagentchat 侧栏聊天](</Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-client-ui-subagent/src/client/sidebar-chat/index.tsx#L173>)、[openChildAside](</Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-client-ui-subagent/src/client/index.ts#L59>)、[message-quotes 选区注册](</Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-message-quotes/src/client/index.ts#L35>)、[interaction dispatch](</Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-client-ui-conversation/src/client/conversation/interaction-registry.ts#L27>)、[chat forkAt](</Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-client-ui-chat/src/client/apply.ts#L304>)、[sessions 契约](</Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-api-session-controller/src/client/contract/sessions.ts#L125>)。
 
 ---
